@@ -1,0 +1,6 @@
+google-genai
+requests
+markdown
+selenium
+google-api-python-client
+google-auth
