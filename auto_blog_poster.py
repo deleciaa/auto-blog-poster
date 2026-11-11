@@ -4,6 +4,8 @@
 설치:
     pip install google-genai requests markdown selenium google-api-python-client google-auth
 
+이미지(무료 스톡사진): PEXELS_API_KEY 또는 UNSPLASH_ACCESS_KEY 중 하나 이상 설정 (둘 다 쓰면 Pexels 우선)
+
 사용:
     python auto_blog_poster.py --dry-run                       # 글 생성만 (게시 안 함, 먼저 이걸로 테스트)
     python auto_blog_poster.py --platforms blogger,wordpress   # 일부만 게시
@@ -38,8 +40,8 @@ log = logging.getLogger("autopost")
 env = os.environ.get
 GEMINI_API_KEY = env("GEMINI_API_KEY")
 GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")   # 모델명이 바뀌면 환경변수로만 교체
-GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY")
-GOOGLE_CSE_CX = os.environ.get("GOOGLE_CSE_CX")  # 맞춤검색 엔진 ID
+PEXELS_API_KEY = env("PEXELS_API_KEY")                  # https://www.pexels.com/api/ (무료)
+UNSPLASH_ACCESS_KEY = env("UNSPLASH_ACCESS_KEY")        # https://unsplash.com/developers (무료)
 
 BLOGGER_ID = env("BLOGGER_ID")
 BLOGGER_TOKEN_PATH = env("BLOGGER_TOKEN_PATH", "token.json")
@@ -54,7 +56,7 @@ VELOG_REFRESH_TOKEN = env("VELOG_REFRESH_TOKEN") or env("VELOG_SESSION_TOKEN")  
 CHROME_USER_DATA = env("CHROME_USER_DATA_PATH", os.path.abspath("./chrome_profile"))
 TISTORY_BLOG_NAME = env("TISTORY_BLOG_NAME")
 NAVER_BLOG_ID = env("NAVER_BLOG_ID")
-BRUNCH_PUBLISH = env("BRUNCH_PUBLISH", "1") == "1"       # 기본: 임시저장만
+BRUNCH_PUBLISH = env("BRUNCH_PUBLISH", "0") == "1"       # 기본: 임시저장만
 
 HTTP_TIMEOUT = 30
 ALL_PLATFORMS = ["blogger", "wordpress", "medium", "velog", "tistory", "naver", "brunch"]
@@ -83,6 +85,7 @@ def strip_non_bmp(text):
 
 def md_to_plain(md_text):
     t = re.sub(r"!\[.*?\]\(.*?\)", "", md_text)
+    t = re.sub(r"^\*사진:.*$", "", t, flags=re.M)
     t = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", t)
     t = re.sub(r"^#{1,6}\s*", "", t, flags=re.M)
     t = re.sub(r"(\*\*|__|\*|`)", "", t)
@@ -90,47 +93,105 @@ def md_to_plain(md_text):
     return strip_non_bmp(t).strip()
 
 
-def get_google_naver_image(query):
-    """구글 검색을 거쳐 네이버 블로그/뉴스에 포함된 실제 사진 URL 추출"""
-    if not (GOOGLE_SEARCH_API_KEY and GOOGLE_CSE_CX):
+_used_images = set()   # 한 글 안에서 같은 사진 중복 방지
+_en_cache = {}
+
+
+def _is_image(url):
+    """HEAD 는 막는 서버가 많아서 Range GET 으로 확인."""
+    try:
+        r = requests.get(url, stream=True, timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-1023"})
+        ok = r.status_code < 400 and "image" in r.headers.get("Content-Type", "")
+        r.close()
+        return ok
+    except requests.RequestException:
+        return False
+
+
+def _to_english_query(query):
+    """한국어 검색어를 스톡사진용 영어 검색어로 변환 (Gemini 사용, 실패하면 None)."""
+    if query in _en_cache:
+        return _en_cache[query]
+    en = None
+    try:
+        r = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"다음 사진 검색어를 스톡사진 사이트용 영어 검색어(2~4단어, 일반 명사/장면)로만 답하세요. 설명 금지.\n{query}",
+        )
+        cand = (r.text or "").strip().splitlines()[0].strip(" \"'.")
+        if cand and cand.isascii():
+            en = cand
+    except Exception as e:
+        log.warning("영어 검색어 변환 실패 (%s): %s", query, e)
+    _en_cache[query] = en
+    return en
+
+
+def _search_pexels(q, lang):
+    r = requests.get("https://api.pexels.com/v1/search",
+                     headers={"Authorization": PEXELS_API_KEY},
+                     params={"query": q, "per_page": 8, "orientation": "landscape", "locale": lang},
+                     timeout=10)
+    r.raise_for_status()
+    for p in r.json().get("photos", []):
+        src = p.get("src", {})
+        url = src.get("large2x") or src.get("large")
+        if url:
+            yield url, f"Photo by {p.get('photographer', '')} on Pexels", None
+
+
+def _search_unsplash(q, lang):
+    r = requests.get("https://api.unsplash.com/search/photos",
+                     headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}", "Accept-Version": "v1"},
+                     params={"query": q, "per_page": 8, "orientation": "landscape"},
+                     timeout=10)
+    r.raise_for_status()
+    for p in r.json().get("results", []):
+        url = p.get("urls", {}).get("regular")
+        if url:
+            yield (url, f"Photo by {p.get('user', {}).get('name', '')} on Unsplash",
+                   p.get("links", {}).get("download_location"))
+
+
+def get_image(query):
+    """무료·상업이용 가능 스톡사진(Pexels → Unsplash)에서 사진 검색.
+    반환: (이미지 URL, 출처 표기) 또는 None.
+    - Google Custom Search JSON API 는 신규 가입이 막혀 있고 2027-01-01 종료 예정이라 제거했습니다.
+    - 다른 블로거의 사진을 긁어오는 방식은 저작권 문제가 있어 쓰지 않습니다."""
+    providers = []
+    if PEXELS_API_KEY:
+        providers.append(("pexels", _search_pexels))
+    if UNSPLASH_ACCESS_KEY:
+        providers.append(("unsplash", _search_unsplash))
+    if not providers:
         return None
 
-    # 구글 검색어 뒤에 site:blog.naver.com 을 붙여 네이버 출처 이미지로 한정
-    search_query = f"{query} site:blog.naver.com"
-    url = "https://www.googleapis.com/customsearch/v1"
-    
-    params = {
-        "key": GOOGLE_SEARCH_API_KEY,
-        "cx": GOOGLE_CSE_CX,
-        "q": search_query,
-        "searchType": "image",  # 이미지 검색 전용
-        "num": 3,
-        "safe": "active"
-    }
+    queries = [(query, "ko-KR")]
+    en = _to_english_query(query)
+    if en:
+        queries.append((en, "en-US"))
 
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        res.raise_for_status()
-        items = res.json().get("items", [])
-
-        for item in items:
-            img_url = item.get("link", "")
-            # 네이버 이미지 서버(postfiles, blogpf, naver.net 등) 링크 검증
-            if "naver" in img_url or "postfiles" in img_url:
-                # 핫링크 깨짐 방지용 간단한 HEAD 요청 검증
-                try:
-                    h = requests.head(img_url, timeout=5, allow_redirects=True)
-                    if h.status_code < 400 and "image" in h.headers.get("Content-Type", ""):
-                        return img_url
-                except requests.RequestException:
-                    continue
-            else:
-                return img_url  # 일반 고화질 관련 이미지 링크 반환
-
-    except Exception as e:
-        log.warning("구글-네이버 이미지 수급 실패 (%s): %s", query, e)
-
+    for q, lang in queries:
+        for name, fn in providers:
+            if name == "unsplash" and lang.startswith("ko"):
+                continue                      # Unsplash 는 영어 검색만 효과적
+            try:
+                for url, credit, track in fn(q, lang):
+                    if url in _used_images or not _is_image(url):
+                        continue
+                    _used_images.add(url)
+                    if track:                 # Unsplash API 가이드라인: 사용 시 download 트리거
+                        try:
+                            requests.get(track, headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}, timeout=5)
+                        except requests.RequestException:
+                            pass
+                    return url, credit
+            except Exception as e:
+                log.warning("이미지 검색 실패 (%s/%s): %s", name, q, e)
+    log.warning("이미지를 찾지 못해 생략합니다: %s", query)
     return None
+
 
 # ---------------------------------------------------------
 # 3. 콘텐츠 생성
@@ -143,7 +204,7 @@ def generate_post(topic):
 - 첫 줄: 'TITLE: 제목' (제목만, 마크다운 기호 금지)
 - 둘째 줄부터 마크다운 본문 (## 소제목 사용, 1500~2500자)
 - 사진이 필요한 위치에 [IMG: 검색키워드] 를 3개 넣으세요.
-  키워드는 네이버 이미지 검색에 바로 쓸 수 있는 구체적인 장소/사물 이름입니다.
+  키워드는 무료 스톡사진 사이트에서 찾을 수 있는 일반적인 장면/사물 표현입니다 (예: 가족 나들이 공원, 노트북으로 코딩하는 모습). 특정 상호명·지명·인물명은 피하세요.
 - 확실하지 않은 영업시간·가격·최신 수치는 단정하지 말고 '확인 필요'라고 쓰세요.
 """
     resp = retry(lambda: client.models.generate_content(model=GEMINI_MODEL, contents=prompt))
@@ -165,8 +226,11 @@ def generate_post(topic):
 
     def repl(m):
         kw = m.group(1).strip()
-        url = get_naver_image(kw)
-        return f"\n\n![{kw}]({url})\n\n" if url else ""
+        img = get_image(kw)
+        if not img:
+            return ""
+        url, credit = img
+        return f"\n\n![{kw}]({url})\n\n*사진: {credit}*\n\n"
 
     md_body = re.sub(r"\[IMG:\s*(.+?)\]", repl, body)
     html_body = markdown.markdown(md_body, extensions=["extra", "nl2br"])
@@ -385,6 +449,8 @@ def main():
 
     if not client:
         raise SystemExit("GEMINI_API_KEY 가 설정되지 않았습니다.")
+    if not (PEXELS_API_KEY or UNSPLASH_ACCESS_KEY):
+        log.warning("PEXELS_API_KEY / UNSPLASH_ACCESS_KEY 가 없어 이미지 없이 게시됩니다.")
 
     log.info("글 생성 중...")
     title, md_body, html_body = generate_post(args.topic)
