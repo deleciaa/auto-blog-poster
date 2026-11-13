@@ -1,68 +1,43 @@
-# 저장소의 .github/workflows/autopost.yml 로 저장하세요.
-# GitHub Actions 에서는 API 플랫폼(블로거/워드프레스/벨로그)만 실행합니다.
-# 티스토리·네이버·브런치는 로그인된 크롬이 필요해서 '내 PC'에서 실행해야 합니다.
-name: auto-blog-poster
+name: Auto Blog Poster
 
 on:
-  workflow_dispatch:          # Actions 탭에서 수동 실행
   schedule:
-    - cron: "0 0 * * *"       # 매일 09:00 (KST). 필요 없으면 이 두 줄 삭제
+    - cron: '30 23 * * *'
+  workflow_dispatch:
 
 jobs:
-  post:
+  publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write        # AI 이미지를 저장소(images/ 폴더)에 올리기 위해 필요
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: 패키지 설치
-        run: pip install google-genai requests markdown google-api-python-client google-auth pillow
+      - name: Install Google Chrome for Headless Selenium
+        uses: browser-actions/setup-chrome@v1
 
-      - name: 블로거 토큰 파일 생성
-        env:
-          BLOGGER_TOKEN_JSON: ${{ secrets.BLOGGER_TOKEN_JSON }}
-        run: printf '%s' "$BLOGGER_TOKEN_JSON" > token.json
+      - name: Install dependencies
+        run: |
+          pip install google-genai requests markdown google-api-python-client google-auth selenium
 
-      - name: 포스팅 실행
-        run: python auto_blog_poster.py --platforms api
+      - name: Run Auto Blog Poster (aaroneom & lhimepapa)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 자동 제공 (Secret 등록 불필요). AI 이미지 업로드용
-          IMAGE_SOURCE: ai                            # ai | stock | none
-          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}   # 선택
-          OPENVERSE_CLIENT_ID: ${{ secrets.OPENVERSE_CLIENT_ID }}   # 선택 (Openverse 403 이면 등록)
-          OPENVERSE_CLIENT_SECRET: ${{ secrets.OPENVERSE_CLIENT_SECRET }}
+          TISTORY_IT_BLOG_NAME: aaroneom
+          TISTORY_FAMILY_BLOG_NAME: lhimepapa
+          TISTORY_COOKIES_JSON: ${{ secrets.TISTORY_COOKIES_JSON }}
           BLOGGER_ID: ${{ secrets.BLOGGER_ID }}
-          WORDPRESS_URL: ${{ secrets.WORDPRESS_URL }}
-          WORDPRESS_USER: ${{ secrets.WORDPRESS_USER }}
-          WORDPRESS_APP_PASS: ${{ secrets.WORDPRESS_APP_PASS }}
-          VELOG_REFRESH_TOKEN: ${{ secrets.VELOG_REFRESH_TOKEN }}
-          VELOG_ACCESS_TOKEN: ${{ secrets.VELOG_ACCESS_TOKEN }}     # 선택
+          BLOGGER_TOKEN_JSON: ${{ secrets.BLOGGER_TOKEN_JSON }}
+        run: |
+          python auto_blog_poster.py --platforms tistory
 
-      - name: 로그 업로드
-        if: always()
+      - name: Upload failure screenshots (if any)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs
+          name: error-logs
           path: logs/
-
-# ---------------------------------------------------------------------------
-# [선택] 티스토리/네이버/브런치도 Actions 에서 돌리고 싶다면: '내 Windows PC' 를 self-hosted runner 로 등록하고
-# 아래 job 을 추가하세요. (PC 가 켜져 있고 로그인된 상태여야 함 / 먼저 PC 에서 --login-setup 1회 필요)
-#
-#  post-web:
-#    runs-on: [self-hosted, windows]
-#    steps:
-#      - uses: actions/checkout@v4
-#      - run: pip install google-genai requests markdown selenium
-#      - run: python auto_blog_poster.py --platforms web
-#        env:
-#          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-#          TISTORY_BLOG_NAME: ${{ secrets.TISTORY_BLOG_NAME }}
-#          NAVER_BLOG_ID: ${{ secrets.NAVER_BLOG_ID }}
-#          CHROME_USER_DATA_PATH: C:/Chrome_Dev_Profile
