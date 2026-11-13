@@ -36,6 +36,8 @@ jobs:
           WORDPRESS_USER: ${{ secrets.WORDPRESS_USER }}
           WORDPRESS_APP_PASS: ${{ secrets.WORDPRESS_APP_PASS }}
           VELOG_REFRESH_TOKEN: ${{ secrets.VELOG_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python auto_blog_poster.py --platforms all --langs ko,en
 
