@@ -1,4 +1,4 @@
-name: Coupang Shorts & Reels Auto Bot (4 Daily)
+name: Coupang Shorts & Reels Auto Bot
 
 on:
   schedule:
@@ -7,9 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       count:
-        description: '생성 및 업로드할 숏폼 개수 (기본 2개)'
+        description: '생성 및 업로드할 영상 개수 (정책 안전 권장: 1)'
         required: false
-        default: '2'
+        default: '1'
+
+permissions:
+  contents: write
 
 jobs:
   publish-shorts-reels:
@@ -33,9 +36,9 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install google-genai requests pillow moviepy==1.0.3 edge-tts google-api-python-client google-auth-oauthlib selenium
+          pip install -U google-genai requests pillow moviepy==1.0.3 edge-tts google-api-python-client google-auth-oauthlib selenium
 
-      - name: Run Coupang Shorts & Reels Bot (2 videos per run)
+      - name: Run Coupang Shorts & Reels Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           COUPANG_ACCESS_KEY: ${{ secrets.COUPANG_ACCESS_KEY }}
@@ -52,8 +55,17 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          COUNT="${{ github.event.inputs.count || '2' }}"
+          COUNT="${{ github.event.inputs.count || '1' }}"
           python coupang_shorts_reels_bot.py --count "$COUNT"
+
+      - name: Commit updated history (posted.json & products_queue.json)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add posted.json products_queue.json logs/ 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "chore: update posted shorts history"
+          git push
 
       - name: Upload failure logs (if any)
         if: failure()
