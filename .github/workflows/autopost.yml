@@ -11,6 +11,8 @@ on:
 jobs:
   post:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # AI 이미지를 저장소(images/ 폴더)에 올리기 위해 필요
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: 패키지 설치
-        run: pip install google-genai requests markdown google-api-python-client google-auth
+        run: pip install google-genai requests markdown google-api-python-client google-auth pillow
 
       - name: 블로거 토큰 파일 생성
         env:
@@ -30,6 +32,8 @@ jobs:
         run: python auto_blog_poster.py --platforms api
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 자동 제공 (Secret 등록 불필요). AI 이미지 업로드용
+          IMAGE_SOURCE: ai                            # ai | stock | none
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}   # 선택
           OPENVERSE_CLIENT_ID: ${{ secrets.OPENVERSE_CLIENT_ID }}   # 선택 (Openverse 403 이면 등록)
           OPENVERSE_CLIENT_SECRET: ${{ secrets.OPENVERSE_CLIENT_SECRET }}
