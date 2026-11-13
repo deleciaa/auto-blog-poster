@@ -12,7 +12,8 @@
     python auto_blog_poster.py --platforms tistory          # 하나만
     python auto_blog_poster.py --login-setup                # (내 PC 최초 1회) 크롬 프로필에 로그인 저장
 
-이미지: UNSPLASH_ACCESS_KEY(선택) → Openverse → Wikimedia Commons 순으로 검색 (모두 상업적 이용 가능한 이미지만).
+이미지: 기본은 Gemini AI 그림(IMAGE_SOURCE=ai) → public GitHub 저장소 images/ 에 업로드. 실패하면 스톡 검색.
+        스톡: UNSPLASH_ACCESS_KEY(선택) → Openverse → Wikimedia Commons 순으로 검색 (모두 상업적 이용 가능한 이미지만).
         Openverse 가 403 이면 OPENVERSE_CLIENT_ID/SECRET 을 등록하세요 (Wikimedia 는 키 불필요).
         PEXELS_API_KEY 는 예전에 발급받은 키가 있을 때만 보조로 사용 (신규 발급은 중단됨).
 로그:   콘솔 + ./logs/run_*.log 에 저장. Selenium 실패 시 ./logs/fail_*.png/.html 로 화면도 저장.
@@ -22,11 +23,19 @@ import re
 import sys
 import time
 import argparse
+import base64
+import io
 import logging
 
 import requests
 import markdown
 from google import genai
+
+try:                      # 선택: AI 이미지를 줄여서(JPEG 1280px) 저장소 용량을 아낌
+    from PIL import Image
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
 
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
@@ -89,6 +98,14 @@ OPENVERSE_CLIENT_ID = env("OPENVERSE_CLIENT_ID")          # 선택 (없어도 �
 OPENVERSE_CLIENT_SECRET = env("OPENVERSE_CLIENT_SECRET")  # 선택
 PEXELS_API_KEY = env("PEXELS_API_KEY")                    # 선택 (신규 발급 중단됨)
 
+# AI 이미지: Gemini 로 그림을 만들고, 'GitHub 저장소(public)'에 올려 그 주소를 글에 넣음
+IMAGE_SOURCE = (env("IMAGE_SOURCE", "ai") or "ai").lower()   # ai(실패 시 스톡 검색) | stock | none
+IMAGE_MODELS = [m.strip() for m in (env("GEMINI_IMAGE_MODELS") or
+                "gemini-2.5-flash-image,gemini-3.1-flash-image-preview").split(",") if m.strip()]
+IMAGE_STYLE = env("IMAGE_STYLE", "따뜻한 색감의 깔끔한 플랫 일러스트 스타일")
+GITHUB_TOKEN = env("GITHUB_TOKEN") or env("GH_TOKEN")        # Actions: secrets.GITHUB_TOKEN / 내 PC: PAT
+GITHUB_REPOSITORY = env("GITHUB_REPOSITORY")                 # owner/repo (Actions 에서는 자동 설정)
+
 BLOGGER_ID = env("BLOGGER_ID")
 BLOGGER_TOKEN_PATH = env("BLOGGER_TOKEN_PATH", "token.json")
 WORDPRESS_URL = (env("WORDPRESS_URL") or "").rstrip("/")
@@ -131,7 +148,7 @@ def strip_non_bmp(text):
 
 def md_to_plain(md_text):
     t = re.sub(r"!\[.*?\]\(.*?\)", "", md_text)
-    t = re.sub(r"^\*사진:.*$", "", t, flags=re.M)
+    t = re.sub(r"^\*(?:사진|이미지):.*$", "", t, flags=re.M)
     t = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", t)
     t = re.sub(r"^#{1,6}\s*", "", t, flags=re.M)
     t = re.sub(r"(\*\*|__|\*|`)", "", t)
@@ -160,22 +177,48 @@ def _is_image(url):
 
 
 def _to_english_query(query):
-    """한국어 검색어 → 영어 검색어 (Gemini). 실패하면 None."""
+    """한국어 검색어 → 영어 검색어(1~3단어). 실패하면 None."""
     if query in _en_cache:
         return _en_cache[query]
     en = None
     try:
         r = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=f"다음 사진 검색어를 스톡사진 사이트용 영어 검색어(2~4단어, 일반 명사/장면)로만 답하세요. 설명 금지.\n{query}",
+            contents=("다음 사진 검색어를 스톡사진 사이트용 영어 검색어(1~3단어, 흔한 일반 명사/장면)로만 답하세요. "
+                      f"기호·따옴표·설명 금지.\n{query}"),
         )
-        cand = (r.text or "").strip().splitlines()[0].strip(" \"'.")
-        if cand and cand.isascii():
+        cand = (r.text or "").strip().splitlines()[0]
+        cand = re.sub(r"[^A-Za-z0-9 ]", " ", cand)          # '* ' 같은 불릿/기호 제거
+        cand = re.sub(r"\s+", " ", cand).strip()
+        if cand:
             en = cand
     except Exception as e:
         log.warning("   영어 검색어 변환 실패 (%s): %s", query, e)
     _en_cache[query] = en
     return en
+
+
+_STOP = {"the", "a", "an", "of", "in", "on", "and", "with", "for", "at", "to", "by"}
+
+
+def _relevant(q, text, lang):
+    """검색어의 모든 단어가 사진 제목/설명/태그에 들어 있을 때만 사용 (엉뚱한 사진 방지)."""
+    if lang.startswith("ko"):
+        toks = re.findall(r"[가-힣A-Za-z0-9]{2,}", q)
+    else:
+        toks = [w for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in _STOP]
+    if not toks:
+        return True
+    t = (text or "").lower()
+    for tok in toks:
+        tok = tok.lower()
+        if re.search(r"[가-힣]", tok):
+            ok = tok in t
+        else:
+            ok = re.search(rf"\b{re.escape(tok)}s?\b", t) is not None
+        if not ok:
+            return False
+    return True
 
 
 def _search_unsplash(q, lang):
@@ -186,8 +229,10 @@ def _search_unsplash(q, lang):
     for p in r.json().get("results", []):
         url = p.get("urls", {}).get("regular")
         if url:
+            text = " ".join([p.get("description") or "", p.get("alt_description") or ""] +
+                            [t.get("title", "") for t in p.get("tags", [])])
             yield (url, f"Photo by {p.get('user', {}).get('name', '')} on Unsplash",
-                   p.get("links", {}).get("download_location"))
+                   p.get("links", {}).get("download_location"), text)
 
 
 def _openverse_token():
@@ -215,19 +260,22 @@ def _search_openverse(q, lang):
     base = {"q": q, "page_size": 10, "license_type": "commercial", "mature": "false"}
     for extra in ({"category": "photograph"}, {}):      # 사진만 → 결과 없으면 조건 완화
         r = requests.get("https://api.openverse.org/v1/images/", headers=headers,
-                         params={**base, **extra}, timeout=15)
+                         params={**base, **extra}, timeout=8)
         if r.status_code == 429:
             raise RuntimeError("Openverse 요청 한도 초과(429)")
         if r.status_code in (401, 403):
             raise RuntimeError("Openverse 접근 거부(%d): 익명 접근이 막혔습니다. "
                                "OPENVERSE_CLIENT_ID / OPENVERSE_CLIENT_SECRET 을 등록하세요." % r.status_code)
+        if r.status_code >= 500:
+            raise RuntimeError("Openverse 서버 오류(%d)" % r.status_code)
         r.raise_for_status()
         results = r.json().get("results", [])
         for p in results:
             url = p.get("url")
             if url:
                 credit = p.get("attribution") or f"{p.get('creator', '')} / {str(p.get('license', '')).upper()} (Openverse)"
-                yield url, credit, None
+                text = " ".join([p.get("title") or ""] + [t.get("name", "") for t in p.get("tags") or []])
+                yield url, credit, None, text
         if results:
             return
 
@@ -251,8 +299,10 @@ def _search_wikimedia(q, lang):
             continue
         url = ii.get("thumburl") or ii.get("url")
         artist = re.sub(r"<[^>]+>", "", meta.get("Artist", {}).get("value", "")).strip() or "Wikimedia Commons"
+        desc = re.sub(r"<[^>]+>", " ", meta.get("ImageDescription", {}).get("value", ""))
+        text = " ".join([p.get("title", "").replace("File:", "").replace("_", " "), desc])
         if url:
-            yield url, f"{artist} / {lic} (Wikimedia Commons)", None
+            yield url, f"{artist} / {lic} (Wikimedia Commons)", None, text
 
 
 def _search_pexels(q, lang):
@@ -263,7 +313,7 @@ def _search_pexels(q, lang):
         src = p.get("src", {})
         url = src.get("large2x") or src.get("large")
         if url:
-            yield url, f"Photo by {p.get('photographer', '')} on Pexels", None
+            yield url, f"Photo by {p.get('photographer', '')} on Pexels", None, p.get("alt") or ""
 
 
 def image_providers():
@@ -277,30 +327,34 @@ def image_providers():
     return p
 
 
-def get_image(query):
-    """(이미지 URL, 출처 문구) 또는 None. 저작권이 정리된 이미지(상업적 이용 가능)만 사용."""
+def get_stock_image(query):
+    """(이미지 URL, 출처 문구) 또는 None.
+    상업적 이용 가능한 이미지 중, 검색어 단어가 제목/설명에 모두 들어 있는 것만 사용 (엉뚱한 사진을 넣느니 생략)."""
     providers = image_providers()
     queries = [(query, "ko-KR")]
     en = _to_english_query(query)
     if en:
         queries.append((en, "en-US"))
         words = en.split()
-        if len(words) > 2:                                # 결과가 없으면 검색어를 더 단순하게
+        if len(words) > 2:
             queries.append((" ".join(words[:2]), "en-US"))
-        if len(words) > 1:
-            queries.append((words[-1], "en-US"))
     log.info("   🖼 이미지 검색: '%s' (영문: %s)", query, en)
 
-    dead = set()                                          # 접근 거부된 공급자는 이번 실행에서 건너뜀
+    dead = set()                                          # 접근 거부/오류가 난 공급자는 이번 실행에서 건너뜀
     for q, lang in queries:
         for name, fn in providers:
             if name in dead or (name == "unsplash" and lang.startswith("ko")):
                 continue
             try:
-                n = 0
-                for url, credit, track in fn(q, lang):
+                n = skipped = 0
+                for url, credit, track, text in fn(q, lang):
                     n += 1
-                    if url in _used_images or not _is_image(url):
+                    if url in _used_images:
+                        continue
+                    if not _relevant(q, text, lang):
+                        skipped += 1
+                        continue
+                    if not _is_image(url):
                         continue
                     _used_images.add(url)
                     if track:                             # Unsplash 가이드라인: 사용 시 download 트리거
@@ -310,13 +364,124 @@ def get_image(query):
                             pass
                     log.info("   🖼 → %s 사용: %s", name, url[:90])
                     return url, credit
-                log.info("   🖼 %s('%s'): 후보 %d개, 사용 가능한 이미지 없음", name, q, n)
+                log.info("   🖼 %s('%s'): 후보 %d개 (관련 없어 제외 %d개), 사용 가능한 이미지 없음", name, q, n, skipped)
             except Exception as e:
                 log.warning("   🖼 %s('%s') 실패: %s", name, q, e)
-                if "접근 거부" in str(e) or "한도 초과" in str(e):
+                if any(k in str(e) for k in ("접근 거부", "한도 초과", "서버 오류", "Timeout", "timed out")):
                     dead.add(name)
-    log.warning("   🖼 이미지를 찾지 못해 생략: %s", query)
+    log.warning("   🖼 관련 있는 이미지를 찾지 못해 생략: %s", query)
     return None
+
+
+# ---- AI 이미지 생성 + GitHub 저장소 호스팅 -------------------------------------
+_gh_cache = {}
+_ai_state = {"dead": False, "warned": False}
+
+
+def _gh_headers():
+    return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def _gh_repo_info():
+    if "info" not in _gh_cache:
+        r = requests.get(f"https://api.github.com/repos/{GITHUB_REPOSITORY}", headers=_gh_headers(), timeout=15)
+        r.raise_for_status()
+        _gh_cache["info"] = r.json()
+    return _gh_cache["info"]
+
+
+def upload_image_github(data, ext):
+    """이미지를 저장소(images/ 폴더)에 올리고 raw 주소를 반환. 저장소가 public 이어야 블로그에서 보입니다."""
+    info = _gh_repo_info()
+    if info.get("private"):
+        raise RuntimeError("저장소가 비공개(private)라 블로그에서 이미지를 볼 수 없습니다. "
+                           "저장소를 public 으로 바꾸거나 IMAGE_SOURCE=stock 으로 설정하세요.")
+    branch = info.get("default_branch", "main")
+    _gh_cache["n"] = _gh_cache.get("n", 0) + 1
+    path = f"images/{time.strftime('%Y%m')}/{RUN_ID}_{_gh_cache['n']}.{ext}"
+    r = requests.put(f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{path}", headers=_gh_headers(),
+                     timeout=60, json={"message": f"add image {path}", "branch": branch,
+                                       "content": base64.b64encode(data).decode()})
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub 업로드 실패 HTTP {r.status_code}: {r.text[:200]}")
+    url = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/{branch}/{path}"
+    for _ in range(4):                                   # 업로드 직후 반영 지연 대비
+        if _is_image(url):
+            return url
+        time.sleep(2)
+    raise RuntimeError(f"업로드는 됐지만 이미지 주소에 접근할 수 없습니다: {url}")
+
+
+def generate_ai_image(prompt):
+    """Gemini 이미지 모델로 그림 생성 → (bytes, mime, 모델명)."""
+    from google.genai import types
+    last = None
+    for model in IMAGE_MODELS:
+        for use_cfg in (True, False):
+            try:
+                cfg = types.GenerateContentConfig(response_modalities=["IMAGE"]) if use_cfg else None
+                resp = client.models.generate_content(model=model, contents=prompt, config=cfg)
+                for cand in resp.candidates or []:
+                    for part in (getattr(cand.content, "parts", None) or []):
+                        inline = getattr(part, "inline_data", None)
+                        if inline is not None and inline.data:
+                            data = inline.data
+                            if isinstance(data, str):
+                                data = base64.b64decode(data)
+                            return data, (inline.mime_type or "image/png"), model
+                last = RuntimeError("응답에 이미지가 없습니다 (안전 정책으로 거부되었을 수 있음)")
+                break
+            except Exception as e:
+                last = e
+                if use_cfg and "modalit" in str(e).lower():
+                    continue                              # 이 모델이 response_modalities 를 싫어하면 설정 없이 재시도
+                break
+        log.warning("   🎨 %s 실패: %s", model, str(last)[:250])
+    raise last or RuntimeError("사용 가능한 이미지 모델이 없습니다")
+
+
+def get_ai_image(query, title=""):
+    prompt = (f"블로그 글 '{title}' 에 들어갈 삽화를 그려 주세요. 장면: {query}. 스타일: {IMAGE_STYLE}. "
+              "가로형 16:9 구도, 이미지 안에 글자·로고·워터마크·숫자 없음, 밝고 가족 친화적인 분위기.")
+    log.info("   🎨 AI 이미지 생성: '%s'", query)
+    t = time.time()
+    data, mime, model = retry(lambda: generate_ai_image(prompt), tries=2, delay=3)
+    ext = "png" if "png" in mime else "jpg"
+    if PIL_OK:
+        try:
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+            im.thumbnail((1280, 1280))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=85, optimize=True)
+            data, ext = buf.getvalue(), "jpg"
+        except Exception as e:
+            log.warning("   🎨 이미지 압축 실패(원본 사용): %s", e)
+    log.info("   🎨 생성 완료: %s, %.0fKB, %s, %.1f초", model, len(data) / 1024, ext, time.time() - t)
+    url = upload_image_github(data, ext)
+    log.info("   🎨 → 업로드 완료: %s", url)
+    return url, f"AI 생성 이미지 ({model})"
+
+
+def get_image(query, title=""):
+    """(이미지 URL, 출처 문구) 또는 None. IMAGE_SOURCE: ai(기본, 실패 시 스톡 검색) | stock | none"""
+    if IMAGE_SOURCE == "none":
+        return None
+    if IMAGE_SOURCE == "ai" and not _ai_state["dead"]:
+        if client and GITHUB_TOKEN and GITHUB_REPOSITORY:
+            try:
+                return get_ai_image(query, title)
+            except Exception as e:
+                msg = str(e)
+                log.warning("   🎨 AI 이미지 실패 → 스톡 검색으로 대체: %s", msg[:250])
+                if any(k in msg for k in ("비공개", "GitHub 업로드 실패", "RESOURCE_EXHAUSTED", "PERMISSION_DENIED",
+                                          "billing", "quota", "429", "403", "401")):
+                    _ai_state["dead"] = True
+                    log.warning("   🎨 같은 원인으로 반복 실패하지 않도록 이번 실행에서는 AI 이미지를 끕니다.")
+        else:
+            _ai_state["dead"] = True
+            log.warning("   🎨 AI 이미지에 필요한 GITHUB_TOKEN / GITHUB_REPOSITORY 가 없어 스톡 검색으로 대체합니다.")
+    return get_stock_image(query)
 
 
 # ---------------------------------------------------------
@@ -330,7 +495,7 @@ def generate_post(topic):
 - 첫 줄: 'TITLE: 제목' (제목만, 마크다운 기호 금지)
 - 둘째 줄부터 마크다운 본문 (## 소제목 사용, 1500~2500자)
 - 사진이 필요한 위치에 [IMG: 검색키워드] 를 3개 넣으세요.
-  키워드는 무료 스톡사진 사이트에서 찾을 수 있는 일반적인 장면/사물 표현입니다 (예: 가족 나들이 공원, 노트북으로 코딩하는 모습). 특정 상호명·지명·인물명은 피하세요.
+  [IMG: ...] 안에는 삽화로 그릴 장면을 한국어 3~10단어로 구체적으로 쓰세요 (예: 공원 벤치에서 노트북으로 일하는 아빠, 스마트폰으로 아이와 사진 찍는 가족, 자율주행차 안에서 웃는 가족). 상표·실존 인물·글자가 들어가는 장면은 피하세요.
 - 확실하지 않은 영업시간·가격·최신 수치는 단정하지 말고 '확인 필요'라고 쓰세요.
 """
     resp = retry(lambda: client.models.generate_content(model=GEMINI_MODEL, contents=prompt))
@@ -352,11 +517,11 @@ def generate_post(topic):
 
     def repl(m):
         kw = m.group(1).strip()
-        img = get_image(kw)
+        img = get_image(kw, title)
         if not img:
             return ""
         url, credit = img
-        return f"\n\n![{kw}]({url})\n\n*사진: {credit}*\n\n"
+        return f"\n\n![{kw}]({url})\n\n*이미지: {credit}*\n\n"
 
     md_body = re.sub(r"\[IMG:\s*(.+?)\]", repl, body)
     html_body = markdown.markdown(md_body, extensions=["extra", "nl2br"])
@@ -413,19 +578,42 @@ def post_to_wordpress(title, html_body):
     raise RuntimeError(f"HTTP {last.status_code}{hint}: {last.text[:200]}")
 
 
+def _velog_headers(access, refresh):
+    cookie = f"refresh_token={refresh}"
+    if access:
+        cookie = f"access_token={access}; " + cookie
+    return {"Cookie": cookie, "Content-Type": "application/json",
+            "Origin": "https://velog.io", "Referer": "https://velog.io/"}
+
+
 def post_to_velog(title, md_body):
     """비공식 GraphQL API 라서 스키마가 바뀌면 깨질 수 있습니다.
-    - writePost 의 meta 는 필수(JSON!) 인자: 빠지면 에러 없이 null 이 돌아옵니다."""
+    - writePost 의 meta 는 필수(JSON!) 인자: 빠지면 에러 없이 null 이 돌아옵니다.
+    - 쓰기 요청은 '요청에 실린 access_token 쿠키'를 사용하는 것으로 보입니다. refresh_token 만 보내면 서버가
+      새 access_token 을 Set-Cookie 로 내려주지만 그 요청 자체는 처리되지 않으므로,
+      ① 가벼운 요청으로 access_token 을 먼저 받아 두고 ② 그 토큰으로 writePost 를 보냅니다."""
     if not VELOG_REFRESH_TOKEN:
         raise RuntimeError("VELOG_REFRESH_TOKEN 누락")
-    cookie = f"refresh_token={VELOG_REFRESH_TOKEN}"
-    if VELOG_ACCESS_TOKEN:
-        cookie = f"access_token={VELOG_ACCESS_TOKEN}; " + cookie
-    headers = {"Cookie": cookie, "Content-Type": "application/json",
-               "Origin": "https://velog.io", "Referer": "https://velog.io/"}
-    log.info("   velog 쿠키: refresh_token(%d자)%s", len(VELOG_REFRESH_TOKEN),
-             f", access_token({len(VELOG_ACCESS_TOKEN)}자)" if VELOG_ACCESS_TOKEN else ", access_token 없음")
+    url = "https://v2.velog.io/graphql"
+    access, refresh = VELOG_ACCESS_TOKEN, VELOG_REFRESH_TOKEN
+    log.info("   velog 쿠키: refresh_token(%d자)%s", len(refresh),
+             f", access_token({len(access)}자)" if access else ", access_token 없음")
 
+    # ① 토큰 갱신
+    res = requests.post(url, json={"query": "query { __typename }"}, headers=_velog_headers(access, refresh),
+                        timeout=HTTP_TIMEOUT)
+    got = res.cookies.get_dict()
+    log.info("   velog 토큰 갱신 요청: HTTP %s, 응답 쿠키=%s", res.status_code,
+             {k: f"{len(v)}자" for k, v in got.items() if k in ("access_token", "refresh_token")} or "없음")
+    if got.get("access_token"):
+        access = got["access_token"]
+    if got.get("refresh_token"):
+        refresh = got["refresh_token"]
+        log.warning("   velog 가 새 refresh_token 을 발급했습니다. 이후 인증 실패가 나면 쿠키를 다시 복사해 시크릿을 갱신하세요.")
+    if not access:
+        log.warning("   velog access_token 을 받지 못했습니다 (refresh_token 만료/오타 가능). 그래도 게시를 시도합니다.")
+
+    # ② 게시
     query = """
     mutation WritePost($title: String, $body: String, $tags: [String], $is_markdown: Boolean,
                        $is_temp: Boolean, $is_private: Boolean, $url_slug: String, $meta: JSON!) {
@@ -440,11 +628,9 @@ def post_to_velog(title, md_body):
     slug = re.sub(r"[^0-9a-zA-Z가-힣]+", "-", title).strip("-")[:60] + f"-{int(time.time())}"
     variables = {"title": title, "body": md_body, "tags": ["IT", "기술", "가족나들이"],
                  "is_markdown": True, "is_temp": False, "is_private": False, "url_slug": slug, "meta": {}}
-    res = requests.post("https://v2.velog.io/graphql", json={"query": query, "variables": variables},
-                        headers=headers, timeout=HTTP_TIMEOUT)
-    log.info("   velog HTTP %s", res.status_code)
-    if "refresh_token=" in (res.headers.get("Set-Cookie") or ""):
-        log.warning("   velog 가 새 refresh_token 을 발급했습니다. 이후 인증 실패가 나면 쿠키를 다시 복사해 시크릿을 갱신하세요.")
+    res = requests.post(url, json={"query": query, "variables": variables},
+                        headers=_velog_headers(access, refresh), timeout=HTTP_TIMEOUT)
+    log.info("   velog 게시 요청: HTTP %s", res.status_code)
     try:
         j = res.json()
     except ValueError:
@@ -455,7 +641,7 @@ def post_to_velog(title, md_body):
         log.warning("   velog errors: %s", str(j["errors"])[:300])
     if not post:
         raise RuntimeError(
-            "벨로그가 빈 결과(null)를 돌려줬습니다. 가능한 원인: ① refresh_token 만료/오타 ② 필수 인자(meta 등) 누락/스키마 변경 "
+            "벨로그가 빈 결과(null)를 돌려줬습니다. 가능한 원인: ① 토큰 만료/오타 ② 필수 인자 누락/스키마 변경 "
             f"③ 신규 계정의 봇 방지(Turnstile) 검사. 응답: {str(j)[:300]}")
     username = ((post.get("user") or {}).get("username"))
     return f"https://velog.io/@{username}/{post.get('url_slug', slug)}" if username else f"slug={post.get('url_slug', slug)}"
@@ -695,7 +881,12 @@ def check_config(targets):
             log.warning("  ⚠️ %-10s 누락: %s  → 이번 실행에서는 건너뜁니다", t, ", ".join(missing))
         else:
             log.info("  ✅ %-10s 설정 확인", t)
-    log.info("  🖼 이미지 검색: %s", " → ".join(n for n, _ in image_providers()))
+    if IMAGE_SOURCE == "ai":
+        if GITHUB_TOKEN and GITHUB_REPOSITORY:
+            log.info("  🎨 이미지: AI 생성(%s) → GitHub 저장소 %s 에 업로드 (실패 시 스톡 검색)", ", ".join(IMAGE_MODELS), GITHUB_REPOSITORY)
+        else:
+            log.warning("  🎨 이미지: AI 생성을 쓰려면 GITHUB_TOKEN / GITHUB_REPOSITORY 필요 → 스톡 검색으로 대체")
+    log.info("  🖼 스톡 검색 공급자: %s", " → ".join(n for n, _ in image_providers()))
     return missing_map
 
 
