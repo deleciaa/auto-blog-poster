@@ -1,21 +1,12 @@
-name: Coupang Shorts & Reels Auto Bot
+name: Auto Blog Poster (Multi-Platform KO/EN)
 
 on:
   schedule:
-    # 한국시간(KST) 매일 오전 11시 30분 (UTC 02:30) & 오후 5시 30분 (UTC 08:30)
-    - cron: '30 2,8 * * *'
+    - cron: '30 23 * * *'
   workflow_dispatch:
-    inputs:
-      count:
-        description: '생성 및 업로드할 영상 개수 (정책 안전 권장: 1)'
-        required: false
-        default: '1'
-
-permissions:
-  contents: write
 
 jobs:
-  publish-shorts-reels:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -26,50 +17,33 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg & Korean Fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-nanum
-
       - name: Install Google Chrome for Headless Selenium
         uses: browser-actions/setup-chrome@v1
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
-          pip install -U google-genai requests pillow moviepy==1.0.3 edge-tts google-api-python-client google-auth-oauthlib selenium
+          pip install google-genai requests markdown google-api-python-client google-auth selenium
 
-      - name: Run Coupang Shorts & Reels Bot
+      - name: Run Auto Blog Poster (KO + EN across all configured platforms)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          COUPANG_ACCESS_KEY: ${{ secrets.COUPANG_ACCESS_KEY }}
-          COUPANG_SECRET_KEY: ${{ secrets.COUPANG_SECRET_KEY }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
-          CLOUDINARY_UPLOAD_PRESET: ${{ secrets.CLOUDINARY_UPLOAD_PRESET }}
-          INPOCK_ADMIN_URL: ${{ secrets.INPOCK_ADMIN_URL }}
-          INPOCK_COOKIES_JSON: ${{ secrets.INPOCK_COOKIES_JSON }}
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          TISTORY_IT_BLOG_NAME: aaroneom
+          TISTORY_FAMILY_BLOG_NAME: lhimepapa
+          TISTORY_COOKIES_JSON: ${{ secrets.TISTORY_COOKIES_JSON }}
+          BLOGGER_ID: ${{ secrets.BLOGGER_ID }}
+          BLOGGER_TOKEN_JSON: ${{ secrets.BLOGGER_TOKEN_JSON }}
+          WORDPRESS_URL: ${{ secrets.WORDPRESS_URL }}
+          WORDPRESS_USER: ${{ secrets.WORDPRESS_USER }}
+          WORDPRESS_APP_PASS: ${{ secrets.WORDPRESS_APP_PASS }}
+          VELOG_REFRESH_TOKEN: ${{ secrets.VELOG_REFRESH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          COUNT="${{ github.event.inputs.count || '1' }}"
-          python coupang_shorts_reels_bot.py --count "$COUNT"
+          python auto_blog_poster.py --platforms all --langs ko,en
 
-      - name: Commit updated history (posted.json & products_queue.json)
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add posted.json products_queue.json logs/ 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "chore: update posted shorts history"
-          git push
-
-      - name: Upload failure logs (if any)
+      - name: Upload failure screenshots (if any)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: shorts-error-logs
+          name: error-logs
           path: logs/
