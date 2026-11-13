@@ -102,20 +102,32 @@ client = genai.Client(
 def call_gemini_smart(contents, use_search=True):
     cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]) if use_search else None
     last_err = None
-    for model_name in dict.fromkeys(MODEL_CANDIDATES):
-        for attempt in range(3):
-            try:
-                return client.models.generate_content(model=model_name, contents=contents, config=cfg)
-            except Exception as e:
-                last_err = e
-                msg = str(e)
-                if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "404" in msg:
-                    log.warning("   ⚠️ [%s] 한도 초과 또는 미지원 모델 → 다음 모델로 즉시 전환", model_name)
-                    break
-                wait_sec = 5 * (attempt + 1)
-                log.warning("   ⚠️ [%s] 일시 오류 (%d초 후 재시도 %d/3): %s", model_name, wait_sec, attempt + 1, msg[:100])
-                time.sleep(wait_sec)
-    raise last_err
+    for model_name in ["gemini-3.5-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash"]:
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.6,
+                ),
+            )
+            data = json.loads(resp.text)
+            for k in ["hook_title", "scenes", "caption", "hashtags"]:
+                if k not in data or not data[k]:
+                    raise ValueError(f"필수 필드 누락: {k}")
+            data["hook_title"] = strip_emojis(data["hook_title"])
+            data["scenes"] = [strip_emojis(s) for s in data["scenes"][:4]]
+            data["caption"] = strip_emojis(data["caption"])
+            data["hashtags"] = [strip_emojis(h).replace("#", "") for h in data["hashtags"][:8]]
+            print(f"[Gemini Success] 사용 모델: {model_name}")
+            return data
+        except Exception as e:
+            err_detail = f"{model_name} -> {e}"
+            print(f"[Gemini Warning] {err_detail}")
+            errors.append(err_detail)
+            time.sleep(2)
+    raise RuntimeError("Gemini 대본 생성 실패:\n" + "\n".join(errors))
 
 
 def strip_non_bmp(text):
