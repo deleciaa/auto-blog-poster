@@ -1,12 +1,3 @@
-"""
-멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종판
-1. [it_news]     🌐 [오늘의 Tech Top 10] MM월 DD일 전 세계 IT·테크 핵심 뉴스 (+ 전문가 논평)
-2. [it_easy]     🌐 [테크 상식] "한줄 훅!" 최신 테크 키워드 쉽게 풀기
-3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기
-
-- 각 주제별로 한국어(KO) 버전 & 영어(EN) 버전을 각각 생성
-- 티스토리(본문 누락 버그 수정 완료: WYSIWYG 재전환 동기화), Blogger, WordPress, Velog 동시 발행 지원
-"""
 import os
 import re
 import sys
@@ -55,26 +46,27 @@ log = logging.getLogger("autopost")
 
 env = os.environ.get
 GEMINI_API_KEY = env("GEMINI_API_KEY")
-GEMINI_MODEL = env("GEMINI_MODEL", "gemini-2.5-flash")
+# 429 한도 초과 시 다음 모델로 자동 전환되도록 모델 리스트 구성
+MODEL_CANDIDATES = [
+    env("GEMINI_MODEL", "gemini-2.5-flash"),
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+]
 IMAGE_SOURCE = (env("IMAGE_SOURCE", "free_ai") or "free_ai").lower()
 UNSPLASH_ACCESS_KEY = env("UNSPLASH_ACCESS_KEY")
 
-# 티스토리 설정
 TISTORY_IT_BLOG_NAME = env("TISTORY_IT_BLOG_NAME") or "aaroneom"
 TISTORY_FAMILY_BLOG_NAME = env("TISTORY_FAMILY_BLOG_NAME") or "lhimepapa"
 TISTORY_COOKIES_JSON = env("TISTORY_COOKIES_JSON")
 
-# Blogger API 설정
 BLOGGER_ID = env("BLOGGER_ID")
 BLOGGER_TOKEN_JSON = env("BLOGGER_TOKEN_JSON")
 BLOGGER_TOKEN_PATH = "token.json"
 
-# WordPress API 설정
 WORDPRESS_URL = (env("WORDPRESS_URL") or "").rstrip("/")
 WORDPRESS_USER = env("WORDPRESS_USER")
 WORDPRESS_APP_PASS = env("WORDPRESS_APP_PASS")
 
-# Velog API 설정
 VELOG_ACCESS_TOKEN = env("VELOG_ACCESS_TOKEN")
 VELOG_REFRESH_TOKEN = env("VELOG_REFRESH_TOKEN")
 
@@ -85,21 +77,27 @@ client = genai.Client(
 
 
 # ---------------------------------------------------------
-# 1. 유틸리티
+# 1. 스마트 모델 폴백 호출기 (429 / 503 자동 방어)
 # ---------------------------------------------------------
-def retry(fn, tries=3, delay=3):
-    for i in range(tries):
-        try:
-            return fn()
-        except Exception as e:
-            log.warning("재시도 %d/%d: %s", i + 1, tries, e)
-            if i == tries - 1:
-                raise
-            time.sleep(delay * (i + 1))
+def call_gemini_smart(contents, use_search=False):
+    cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]) if use_search else None
+    last_err = None
+    for model_name in dict.fromkeys(MODEL_CANDIDATES):
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(model=model_name, contents=contents, config=cfg)
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    log.warning("   ⚠️ [%s] 일일/분당 한도 초과 → 다음 모델로 즉시 전환", model_name)
+                    break  # 다음 모델로 이동
+                log.warning("   ⚠️ [%s] 일시 오류 재시도 (%d/2): %s", model_name, attempt + 1, msg[:120])
+                time.sleep(3)
+    raise last_err
 
 
 def strip_non_bmp(text):
-    """ChromeDriver 입력 오류를 유발하는 4바이트 이모지 제거 (티스토리 제목/본문 안정성)."""
     return "".join(ch for ch in text if ord(ch) <= 0xFFFF)
 
 
@@ -114,7 +112,7 @@ def md_to_plain(md_text):
 
 
 # ---------------------------------------------------------
-# 2. 무료 AI 이미지 + 스톡 폴백 (연속 호출 간격 확보)
+# 2. 무료 AI 이미지 + 스톡 폴백
 # ---------------------------------------------------------
 _used_images = set()
 
@@ -137,7 +135,7 @@ def get_free_ai_image(en_prompt):
     full_prompt = f"{en_prompt}, editorial illustration, clean modern style, high quality, no text, no watermark"
     url = f"https://image.pollinations.ai/prompt/{quote(full_prompt)}?width=1200&height=675&model=flux&seed={seed}&nologo=true"
     log.info("   🎨 무료 AI 이미지 생성: '%s'", en_prompt)
-    time.sleep(3)  # Pollinations 연속 호출 스로틀링 방지
+    time.sleep(3)
     if _is_image_reachable(url):
         return url, "AI Illustration (Pollinations.ai)"
     raise RuntimeError("Pollinations 응답 지연")
@@ -211,7 +209,7 @@ def get_image(en_keyword):
 
 
 # ---------------------------------------------------------
-# 3. 3가지 핵심 카테고리 (한국어 생성 + 영어 번역/로컬라이징)
+# 3. 3가지 핵심 카테고리 (1회 호출로 한국어+영어 동시 생성 -> API 쿼터 50% 절약)
 # ---------------------------------------------------------
 POST_CATEGORIES = {
     "it_news": {
@@ -222,18 +220,16 @@ POST_CATEGORIES = {
         "tags_en": ["TechNews", "TechTop10", "ITInsights", "GlobalTech", "EnterpriseIT"],
         "prompt": f"""
 당신은 글로벌 IT 인프라·클라우드·네트워크 업계에서 14년 넘게 현장을 뛰어온 IT 전문가입니다.
-Google 검색 도구를 사용해 **오늘({TODAY_KO}, 2026년 기준) 전 세계 및 한국 IT·테크 업계에서 가장 화제가 되고 있는 핵심 뉴스 10가지**를 선정하고, 독자들이 바쁜 아침에 한눈에 파악할 수 있도록 정리한 뒤 현업 전문가의 깊이 있는 논평을 작성하세요.
+Google 검색 도구를 사용해 **오늘({TODAY_KO}, 2026년 기준) 전 세계 및 한국 IT·테크 업계에서 가장 화제가 되고 있는 핵심 뉴스 10가지**를 선정해 브리핑하고 현업 전문가의 논평을 작성하세요.
 
-[제목 형식 - 반드시 아래 포맷을 따를 것]
-TITLE: 🌐 [오늘의 Tech Top 10] {TODAY_KO} 전 세계 IT·테크 핵심 뉴스
+[제목 형식]
+- 한국어 제목: `🌐 [오늘의 Tech Top 10] {TODAY_KO} 전 세계 IT·테크 핵심 뉴스`
+- 영어 제목: `🌐 [Today's Tech Top 10] {TODAY_EN}: Global IT & Tech News Highlights`
 
-[본문 구성 및 문체 - 공백 포함 2,500~3,200자]
-- 실제 현업 전문가가 동료와 독자들에게 브리핑하듯 담백하고 통찰력 있는 1인칭 시점('~합니다', '~라고 봅니다').
-- AI 특유의 상투어("새로운 지평", "결론적으로")와 괄호형 메모("(확인 필요)") 절대 금지.
-- 구성:
-  1. 짧은 오프닝: 오늘 글로벌 테크 시장의 전반적인 흐름 한 줄 요약.
-  2. `## 오늘의 글로벌 Tech Top 10 핵심 브리핑`: 1번부터 10번까지 번호를 매겨 각 뉴스의 핵심 팩트(기업명·기술명·변화)와 의미(한 줄 코멘트)를 밀도 있게 정리.
-  3. `## 현업 IT 전문가의 심층 논평`: 위 10가지 뉴스 중 가장 파급력이 큰 1~2가지 흐름을 콕 집어, 실제 기업 인프라·비즈니스 현장에서 어떤 실질적인 변화와 리스크가 생길지 날카롭게 분석.
+[본문 구성 - 각 언어별 2,500자 이상 풍부하게]
+1. 짧은 오프닝: 오늘 글로벌 테크 시장의 전반적인 흐름 한 줄 요약.
+2. `## 오늘의 글로벌 Tech Top 10 핵심 브리핑` (영문: `## Today's Global Tech Top 10 Briefing`): 1번부터 10번까지 번호를 매겨 각 뉴스의 핵심 팩트와 한 줄 코멘트 정리.
+3. `## 현업 IT 전문가의 심층 논평` (영문: `## Industry Veteran's Deep-Dive Commentary`): 위 뉴스 중 가장 파급력이 큰 1~2가지 흐름이 기업 인프라와 비즈니스에 미칠 실질적 변화와 리스크 분석.
 """
     },
     "it_easy": {
@@ -242,21 +238,19 @@ TITLE: 🌐 [오늘의 Tech Top 10] {TODAY_KO} 전 세계 IT·테크 핵심 뉴�
         "allow_velog": True,
         "tags_ko": ["테크상식", "쉬운IT", "IT용어정리", "반도체기초", "초보자가이드"],
         "tags_en": ["TechExplained", "TechBasics", "EasyIT", "FutureTech", "TechGlossary"],
-        "prompt": f"""
+        "prompt": """
 당신은 복잡한 최신 IT·반도체·AI 기술을 초등학생 아이와 비전공자도 단번에 이해할 수 있도록 재미있게 풀어내는 IT 스토리텔러입니다.
-Google 검색을 참고하여 **요즘 테크 업계에서 핫하게 떠오르는 핵심 기술 키워드 1가지**(예: 글라스 기판(Glass Substrate), CXL 메모리, 온디바이스 AI, 유리기판 패키징, 양자내성암호, AI 에이전트 등 중 오늘 가장 흥미로운 주제 1개)를 선정해 소개하세요.
+Google 검색을 참고하여 **요즘 테크 업계에서 핫하게 떠오르는 핵심 기술 키워드 1가지**(예: 글라스 기판(Glass Substrate), CXL 메모리, 온디바이스 AI, 양자내성암호, AI 에이전트 등 중 택1)를 선정해 소개하세요.
 
-[제목 형식 - 반드시 아래 포맷을 따를 것 (큰따옴표 안에 호기심을 자극하는 한 줄 훅 포함)]
-TITLE: 🌐 [테크 상식] "에너지 효율의 끝판왕!" 글라스 기판 (Glass Substrate)
-*(위 예시는 형식 샘플이므로, 실제 선정한 키워드와 그에 맞는 재치 있는 한 줄 문구로 제목을 만드세요.)*
+[제목 형식]
+- 한국어 제목: `🌐 [테크 상식] "재치있는 한줄 훅!" 기술명 (영문명)` (예: `🌐 [테크 상식] "에너지 효율의 끝판왕!" 글라스 기판 (Glass Substrate)`)
+- 영어 제목: `🌐 [Tech Explained] "Catchy Hook!" Technology Name`
 
-[본문 구성 및 문체 - 공백 포함 2,200~2,800자]
-- 실제 사람이 재미있게 이야기를 들려주듯 생동감 있고 친근한 어조.
-- 구성:
-  1. `## 왜 요즘 다들 이 기술에 열광할까?`: 뉴스에 자꾸 등장하는 이유를 일상 속 불편함(예: 스마트폰 발열, AI 전기 먹는 하마 등)과 연결해 쉽게 시작.
-  2. `## 초등학생도 1분 만에 이해하는 핵심 비유`: '고속도로 포장', '도시락 통', '아파트 층수' 같은 직관적인 비유로 기존 기술과 무엇이 다른지 설명.
-  3. `## 우리 생활은 어떻게 달라질까?`: 이 기술이 상용화되면 우리가 쓰는 스마트폰, 노트북, AI 서비스가 어떻게 더 빨라지고 가벼워지는지 구체적으로 묘사.
-  4. `## 한눈에 정리하는 오늘의 테크 포인트`: 핵심 3줄 요약.
+[본문 구성 - 각 언어별 2,200자 이상]
+1. 왜 요즘 다들 이 기술에 열광할까? (일상 속 불편함과 연결)
+2. 초등학생도 1분 만에 이해하는 핵심 비유 (직관적인 사물 비유 필수)
+3. 우리 생활은 어떻게 달라질까?
+4. 한눈에 정리하는 오늘의 테크 포인트 3줄 요약.
 """
     },
     "family_trip": {
@@ -267,104 +261,91 @@ TITLE: 🌐 [테크 상식] "에너지 효율의 끝판왕!" 글라스 기판 (G
         "tags_en": ["KoreaFamilyTravel", "KidsActivitiesKorea", "WeekendTripKorea", "FamilyOuting", "TravelWithKids"],
         "prompt": """
 당신은 7살 딸과 5살 아들을 키우는 현실 육아 아빠입니다.
-Google 검색을 활용해 대한민국에서 **7살·5살 남매와 함께 주말에 다녀오기 정말 좋은 실제 나들이 명소 1~2곳 연계 코스**(예: 부천 로보파크 & 부천자연생태공원, 과천과학관 & 서울대공원, 인천 어린이과학관 & 아라뱃길, 수원 화성행궁 & 박물관 등 실제 존재하는 인기 가족 나들이 코스)를 선정하여, 다른 부모들이 이 글만 보고 그대로 따라가도 실패하지 않을 실전 정복기를 작성하세요.
+Google 검색을 활용해 대한민국에서 **7살·5살 남매와 함께 주말에 다녀오기 정말 좋은 실제 나들이 명소 1~2곳 연계 코스**를 선정하여, 다른 부모들이 이 글만 보고 그대로 따라가도 실패하지 않을 실전 정복기를 작성하세요.
 
-[제목 형식 - 반드시 아래 포맷을 따를 것]
-TITLE: [주말 나들이] "오감만족 물놀이와 곤충들의 세계" + 7살 딸, 5살 아들과 함께한 [부천테크노파크 로보파크 & 부천자연생태공원 실내관] 정복기
-*(위 예시는 형식 샘플이므로, 실제 선정한 장소와 그 장소의 핵심 재미를 담은 문구로 제목을 작성하세요.)*
+[제목 형식]
+- 한국어 제목: `[주말 나들이] "매력적인 한줄 훅" + 7살 딸, 5살 아들과 함께한 [실제 장소명] 정복기`
+- 영어 제목: `[Weekend Outing in Korea] "Catchy Hook" + Exploring [Place Name] with a 7yo Daughter & 5yo Son`
 
-[본문 구성 및 문체 - 공백 포함 2,300~2,900자]
-- 실제 두 아이 손을 잡고 다녀온 아빠가 육아 동지들에게 진심으로 공유하는 생생하고 다정한 후기 문체. (허구적인 SF 기술 절대 금지, AI 티 나는 상투어 금지)
-- 구성:
-  1. `## 7살 누나와 5살 동생, 둘 다 만족시킨 코스의 매력`: 연령과 성향이 다른 남매가 각각 어떤 포인트에서 눈을 반짝였는지 생생하게 전달.
-  2. `## 그대로 따라 하는 반나절 실전 이동 동선`: 오전 도착 시간부터 관람 순서, 점심 식사, 오후 코스까지 아이들 체력을 고려한 최적의 타임라인 제시.
-  3. `## 아빠가 직접 겪고 챙긴 현실 꿀팁 (주차·준비물·예약)`: 주차장 위치 및 혼잡 피하는 시간, 사전 예약 필요 여부, 챙겨가면 좋은 준비물(여벌 옷, 간식, 돗자리 등)을 꼼꼼하게 정리.
-  4. `## 아이들과 함께하기 좋은 근처 식사 & 휴식 팁`: 아이들 입맛에 맞는 식당 메뉴나 휴식 공간 정보.
+[본문 구성 - 각 언어별 2,300자 이상]
+1. 7살 누나와 5살 동생, 둘 다 만족시킨 코스의 매력
+2. 그대로 따라 하는 반나절 실전 이동 동선 (시간대별 제안)
+3. 아빠가 직접 겪고 챙긴 현실 꿀팁 (주차장 위치, 예약 팁, 준비물)
+4. 아이들과 함께하기 좋은 근처 식사 & 휴식 팁.
 """
     }
 }
 
 
-def generate_korean_post(category_key):
+def generate_bilingual_posts(category_key):
+    """단 1회의 API 호출로 한국어(KO)와 영어(EN) 포스팅을 동시에 생성하여 API 한도를 절반으로 아낍니다."""
     cat = POST_CATEGORIES[category_key]
     prompt = f"""
 {cat['prompt']}
 
-[공통 절대 규칙]
-1. 첫 줄은 반드시 `TITLE: ...` 형식으로 제목만 출력하세요. (제목 앞뒤에 `**`나 `#` 붙이지 말 것)
-2. 본문 중간에 시각 자료가 들어가면 가장 자연스러운 위치에 `[IMG: 영문 묘사 3~6단어]` 태그를 **정확히 2개** 넣으세요.
-   - 예시: `[IMG: futuristic semiconductor glass substrate microchip macro]`, `[IMG: korean father with two young kids at science museum]`
-   - 반드시 영어로만 적고, 글자(text)가 들어가는 장면은 피하세요.
-3. 본문에 `(확인 필요)`, `(요금 확인 필요)` 같은 괄호 메모를 절대 출력하지 마세요.
-4. 가상의 화자 이름(김대현 등)을 지어내지 마세요.
+[출력 형식 - 반드시 아래 구분자(===KO_START===, ===EN_START===)를 정확히 지켜서 출력하세요]
+===KO_START===
+TITLE: 한국어 제목
+(한국어 마크다운 본문 - 중간에 [IMG: 영문 묘사 3~6단어] 태그 2개 삽입)
+===EN_START===
+TITLE: English Title
+(자연스러운 영어 로컬라이징 마크다운 본문 - 한국어 본문과 동일한 위치에 동일한 [IMG: 영문 묘사 3~6단어] 태그 2개 삽입)
+
+[절대 금지]
+- 괄호형 메모 `(확인 필요)` 등 절대 출력 금지.
+- AI 번역투("새로운 지평", "결론적으로", "In conclusion", "delve into") 금지.
+- 가상의 화자 이름(김대현 등) 금지.
 """
-    cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
-    resp = retry(lambda: client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=cfg))
-    text = (resp.text or "").strip()
-    if not text:
-        raise RuntimeError("Gemini 한국어 글 생성 응답이 비어 있습니다.")
+    resp = call_gemini_smart(prompt, use_search=cat["use_search"])
+    raw = (resp.text or "").strip()
+    raw = re.sub(r"\([^)]*확인\s*필요[^)]*\)", "", raw)
 
-    text = re.sub(r"\([^)]*확인\s*필요[^)]*\)", "", text)
-    text = re.sub(r"\[[^]]*확인\s*필요[^]]*\]", "", text)
+    # KO / EN 블록 분리
+    ko_part, en_part = raw, ""
+    if "===EN_START===" in raw:
+        parts = raw.split("===EN_START===", 1)
+        ko_part = parts[0].replace("===KO_START===", "").strip()
+        en_part = parts[1].strip()
 
-    lines = text.splitlines()
-    title, body_start = None, 0
-    for i, line in enumerate(lines[:5]):
-        m = re.match(r"^[#*\s]*TITLE\s*[:：]\s*(.+?)[*\s]*$", line.strip(), re.I)
-        if m:
-            title, body_start = m.group(1).strip(), i + 1
-            break
-    if not title:
-        title = re.sub(r"^[#*\s]+|[*\s]+$", "", lines[0])
-        body_start = 1
+    def parse_block(block_text):
+        lines = block_text.splitlines()
+        title, body_start = None, 0
+        for i, line in enumerate(lines[:5]):
+            m = re.match(r"^[#*\s]*TITLE\s*[:：]\s*(.+?)[*\s]*$", line.strip(), re.I)
+            if m:
+                title, body_start = m.group(1).strip(), i + 1
+                break
+        if not title:
+            title = re.sub(r"^[#*\s]+|[*\s]+$", "", lines[0])
+            body_start = 1
+        return title, "\n".join(lines[body_start:]).strip()
 
-    raw_md = "\n".join(lines[body_start:]).strip()
+    title_ko, md_ko_raw = parse_block(ko_part)
+    title_en, md_en_raw = parse_block(en_part) if en_part else ("", "")
 
-    # [IMG: ...] 태그를 실제 이미지 URL로 치환 (영어 버전에서도 동일한 이미지를 재사용하기 위해 치환된 마크다운 반환)
-    def repl(m):
-        kw = m.group(1).strip()
-        img = get_image(kw)
-        if not img:
-            return ""
-        url, credit = img
-        return f"\n\n![{kw}]({url})\n\n*Image: {credit}*\n\n"
+    # 이미지 생성 (2장만 생성해 KO와 EN 본문에 동일하게 삽입)
+    img_tags = re.findall(r"\[IMG:\s*(.+?)\]", md_ko_raw)
+    resolved_imgs = []
+    for kw in img_tags[:2]:
+        img = get_image(kw.strip())
+        if img:
+            url, credit = img
+            resolved_imgs.append(f"\n\n![{kw.strip()}]({url})\n\n*Image: {credit}*\n\n")
+        else:
+            resolved_imgs.append("")
 
-    md_ko = re.sub(r"\[IMG:\s*(.+?)\]", repl, raw_md)
-    return title, md_ko
+    def apply_images(md_text):
+        idx = 0
+        def _rep(m):
+            nonlocal idx
+            val = resolved_imgs[idx] if idx < len(resolved_imgs) else ""
+            idx += 1
+            return val
+        return re.sub(r"\[IMG:\s*(.+?)\]", _rep, md_text)
 
-
-def translate_to_english_post(title_ko, md_ko, category_key):
-    """한국어 완성 글을 외국인 독자가 읽기 자연스러운 영문 블로그 포스팅으로 로컬라이징 번역."""
-    prompt = f"""
-You are a bilingual Korean-English tech & lifestyle blogger (a 14-year IT industry veteran and dad of two kids in Korea).
-Translate and naturally localize the following Korean blog post into engaging, idiomatic English for international readers.
-
-[Rules]
-1. First line MUST be: `TITLE: <translated engaging English title>` (Keep the bracketed style like `🌐 [Today's Tech Top 10] {TODAY_EN} ...` or `🌐 [Tech Explained] ...` or `[Weekend Outing in Korea] ...`).
-2. Preserve all Markdown headings (`##`), lists, bold text, and **KEEP ALL EXISTING IMAGE MARKDOWN LINKS `![...](http...)` AND `*Image: ...*` EXACTLY AS THEY ARE** in their corresponding positions.
-3. Do NOT add AI clichés ("In conclusion", "delve into", "tapestry"). Write naturally like an authentic human blogger.
-4. Keep the full depth and length of the original post.
-
-[Korean Title]
-{title_ko}
-
-[Korean Content]
-{md_ko}
-"""
-    resp = retry(lambda: client.models.generate_content(model=GEMINI_MODEL, contents=prompt))
-    text = (resp.text or "").strip()
-    lines = text.splitlines()
-    title_en, body_start = None, 0
-    for i, line in enumerate(lines[:5]):
-        m = re.match(r"^[#*\s]*TITLE\s*[:：]\s*(.+?)[*\s]*$", line.strip(), re.I)
-        if m:
-            title_en, body_start = m.group(1).strip(), i + 1
-            break
-    if not title_en:
-        title_en = re.sub(r"^[#*\s]+|[*\s]+$", "", lines[0])
-        body_start = 1
-    md_en = "\n".join(lines[body_start:]).strip()
-    return title_en, md_en
+    md_ko = apply_images(md_ko_raw)
+    md_en = apply_images(md_en_raw) if md_en_raw else ""
+    return title_ko, md_ko, title_en, md_en
 
 
 def md_to_styled_html(md_text):
@@ -381,7 +362,7 @@ def md_to_styled_html(md_text):
 
 
 # ---------------------------------------------------------
-# 4. 티스토리 웹 자동화 (본문 누락 해결: HTML 주입 후 기본모드 복귀 동기화)
+# 4. 티스토리 웹 자동화 (CodeMirror + React 상태 강제 동기화)
 # ---------------------------------------------------------
 def init_headless_driver():
     options = webdriver.ChromeOptions()
@@ -397,7 +378,7 @@ def init_headless_driver():
 
 def inject_cookies_for_domain(driver, target_url):
     if not TISTORY_COOKIES_JSON:
-        raise RuntimeError("TISTORY_COOKIES_JSON 시크릿이 설정되지 않았습니다.")
+        raise RuntimeError("TISTORY_COOKIES_JSON 시크릿 누락")
     cookies = json.loads(TISTORY_COOKIES_JSON)
     driver.get(target_url)
     time.sleep(2)
@@ -447,31 +428,45 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
         pass
     time.sleep(1)
 
-    # 3. CodeMirror 에 HTML 주입
+    # 3. CodeMirror 에 HTML 주입 + 변경 이벤트 강제 발생
     safe_html = strip_non_bmp(html_body)
     n = driver.execute_script(
-        "var cm = document.querySelector('.CodeMirror');"
-        "if(!cm || !cm.CodeMirror) return -1;"
-        "cm.CodeMirror.setValue(arguments[0]);"
-        "cm.CodeMirror.save();"
-        "return cm.CodeMirror.getValue().length;",
+        """
+        var cmEl = document.querySelector('.CodeMirror');
+        if (!cmEl || !cmEl.CodeMirror) return -1;
+        var cm = cmEl.CodeMirror;
+        cm.setValue(arguments[0]);
+        cm.save();
+        var ta = cm.getTextArea();
+        if (ta) {
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            ta.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return cm.getValue().length;
+        """,
         safe_html,
     )
     if n is None or n <= 0:
         raise RuntimeError("티스토리 HTML 에디터(CodeMirror) 주입 실패")
-    log.info("   📝 HTML 코드 주입 확인: %d자", n)
+    log.info("   📝 HTML 코드 주입 및 이벤트 동기화 완료: %d자", n)
     time.sleep(1)
 
-    # 4. [핵심 수정] 기본모드(WYSIWYG)로 다시 전환하여 에디터 내부 React 상태에 본문 강제 동기화
-    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-layer-btn-open"))).click()
-    time.sleep(0.5)
-    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-wysiwyg"))).click()
-    time.sleep(1)
+    # 4. 기본모드로 안전 복귀 (모드 전환 버튼 텍스트/셀렉터 유연하게 탐색)
     try:
-        driver.switch_to.alert.accept()
-    except NoAlertPresentException:
-        pass
-    time.sleep(1.5)
+        mode_btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-layer-btn-open")))
+        mode_btn.click()
+        time.sleep(0.5)
+        wysiwyg_btn = driver.find_element(By.XPATH, "//div[@id='editor-mode-layer']//div[contains(., '기본모드')] | //*[@id='editor-mode-wysiwyg']")
+        wysiwyg_btn.click()
+        time.sleep(1)
+        try:
+            driver.switch_to.alert.accept()
+        except NoAlertPresentException:
+            pass
+        log.info("   🔄 기본모드(WYSIWYG) 동기화 완료")
+        time.sleep(1)
+    except Exception as e:
+        log.info("   ℹ️ 기본모드 복귀 스킵 (HTML 모드 유지 발행 진행): %s", str(e)[:60])
 
     # 5. 태그 입력
     try:
@@ -483,7 +478,7 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
     except Exception:
         pass
 
-    # 6. 발행 설정 및 최종 발행
+    # 6. 발행 버튼 클릭
     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#publish-layer-btn"))).click()
     time.sleep(1)
     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#open20"))).click()
@@ -561,7 +556,7 @@ def post_to_velog(title, md_body, tags):
 
 
 # ---------------------------------------------------------
-# 6. 메인 컨트롤러 (한/영 듀얼 생성 + 멀티 플랫폼 일괄 발행)
+# 6. 메인 컨트롤러
 # ---------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -575,11 +570,7 @@ def main():
         raise SystemExit("GEMINI_API_KEY 시크릿이 없습니다.")
 
     raw_platforms = [p.strip().lower() for p in args.platforms.split(",") if p.strip()]
-    if "all" in raw_platforms:
-        targets = ["tistory", "blogger", "wordpress", "velog"]
-    else:
-        targets = raw_platforms
-
+    targets = ["tistory", "blogger", "wordpress", "velog"] if "all" in raw_platforms else raw_platforms
     langs = [l.strip().lower() for l in args.langs.split(",") if l.strip()]
     categories = list(POST_CATEGORIES.keys()) if args.category == "all" else [args.category]
 
@@ -594,26 +585,23 @@ def main():
                 continue
             cat = POST_CATEGORIES[cat_key]
             log.info("\n==================================================")
-            log.info("✍️  [%s] 한국어 원문 생성 시작", cat["name"])
-            title_ko, md_ko = generate_korean_post(cat_key)
+            log.info("✍️  [%s] 한/영 듀얼 원고 생성 시작 (1회 호출 절약 모드)", cat["name"])
+            title_ko, md_ko, title_en, md_en = generate_bilingual_posts(cat_key)
             log.info("📌 [KO] 제목: %s (%d자)", title_ko, len(md_to_plain(md_ko)))
+            if title_en:
+                log.info("📌 [EN] Title: %s (%d chars)", title_en, len(md_to_plain(md_en)))
 
             posts_to_publish = []
-            if "ko" in langs:
+            if "ko" in langs and title_ko:
                 posts_to_publish.append(("KO", title_ko, md_ko, md_to_styled_html(md_ko), cat["tags_ko"]))
-
-            if "en" in langs:
-                log.info("🌐 [%s] 영문(EN) 버전 로컬라이징 변환 중...", cat["name"])
-                title_en, md_en = translate_to_english_post(title_ko, md_ko, cat_key)
-                log.info("📌 [EN] Title: %s (%d chars)", title_en, len(md_to_plain(md_en)))
+            if "en" in langs and title_en:
                 posts_to_publish.append(("EN", title_en, md_en, md_to_styled_html(md_en), cat["tags_en"]))
 
             for lang_code, title, md_body, html_body, tags in posts_to_publish:
                 if args.dry_run:
-                    print(f"\n=== [{cat_key} | {lang_code}] {title} ===\n{md_body[:600]}...\n")
+                    print(f"\n=== [{cat_key} | {lang_code}] {title} ===\n{md_body[:500]}...\n")
                     continue
 
-                # 1) 티스토리 (IT -> aaroneom, 육아 -> lhimepapa)
                 if "tistory" in targets and driver:
                     try:
                         url = post_to_tistory(driver, cat["tistory_blog"], title, html_body, tags)
@@ -624,7 +612,6 @@ def main():
                         log.error("❌ [티스토리:%s][%s] 실패: %s", cat["tistory_blog"], lang_code, e)
                         driver.save_screenshot(os.path.join(LOG_DIR, f"fail_tistory_{cat_key}_{lang_code}.png"))
 
-                # 2) Blogger (설정된 경우 자동 발행)
                 if "blogger" in targets and BLOGGER_ID:
                     try:
                         url = post_to_blogger(title, html_body, tags)
@@ -634,7 +621,6 @@ def main():
                         results[f"{cat_key}[{lang_code}]:blogger"] = ("FAIL", str(e))
                         log.error("❌ [Blogger][%s] 실패: %s", lang_code, e)
 
-                # 3) WordPress (설정된 경우 자동 발행)
                 if "wordpress" in targets and WORDPRESS_URL:
                     try:
                         url = post_to_wordpress(title, html_body)
@@ -644,7 +630,6 @@ def main():
                         results[f"{cat_key}[{lang_code}]:wordpress"] = ("FAIL", str(e))
                         log.error("❌ [WordPress][%s] 실패: %s", lang_code, e)
 
-                # 4) Velog (IT 카테고리만 자동 발행, 설정된 경우)
                 if "velog" in targets and cat["allow_velog"] and VELOG_REFRESH_TOKEN:
                     try:
                         url = post_to_velog(title, md_body, tags)
