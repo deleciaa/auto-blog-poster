@@ -59,7 +59,8 @@ GEMINI_API_KEY = env("GEMINI_API_KEY")
 MODEL_CANDIDATES = [
     env("GEMINI_MODEL", "gemini-3.8-flash"),
     "gemini-2.5-flash",
-    "gemini-2.5-pro",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
 ]
 IMAGE_SOURCE = (env("IMAGE_SOURCE", "free_ai") or "free_ai").lower()
 UNSPLASH_ACCESS_KEY = env("UNSPLASH_ACCESS_KEY")
