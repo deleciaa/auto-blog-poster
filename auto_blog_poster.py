@@ -53,7 +53,10 @@ BLOGGER_ID = env("BLOGGER_ID")
 BLOGGER_TOKEN_JSON = env("BLOGGER_TOKEN_JSON")
 BLOGGER_TOKEN_PATH = "token.json"
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(api_version="v1beta")
+) if GEMINI_API_KEY else None
 
 
 # ---------------------------------------------------------
