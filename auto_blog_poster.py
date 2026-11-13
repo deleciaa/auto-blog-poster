@@ -1,3 +1,13 @@
+"""
+멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본
+1. [it_news]     🌐 [오늘의 Tech Top 10] MM월 DD일 전 세계 IT·테크 핵심 뉴스 (+ 전문가 논평)
+2. [it_easy]     🌐 [테크 상식] "한줄 훅!" 최신 테크 키워드 쉽게 풀기
+3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기
+
+- 단 1회의 Gemini API 호출로 한국어(KO) + 영어(EN) 동시 생성 (일일 쿼터 50% 절약)
+- 429 한도 초과 시 대체 모델(gemini-2.5-flash-lite, gemini-2.0-flash) 자동 전환
+- 티스토리(TinyMCE 직접 주입 + HTML/WYSIWYG 복귀 2중 안전장치), Blogger, WordPress, Velog 동시 발행
+"""
 import os
 import re
 import sys
@@ -46,7 +56,6 @@ log = logging.getLogger("autopost")
 
 env = os.environ.get
 GEMINI_API_KEY = env("GEMINI_API_KEY")
-# 429 한도 초과 시 다음 모델로 자동 전환되도록 모델 리스트 구성
 MODEL_CANDIDATES = [
     env("GEMINI_MODEL", "gemini-2.5-flash"),
     "gemini-2.5-flash-lite",
@@ -55,18 +64,22 @@ MODEL_CANDIDATES = [
 IMAGE_SOURCE = (env("IMAGE_SOURCE", "free_ai") or "free_ai").lower()
 UNSPLASH_ACCESS_KEY = env("UNSPLASH_ACCESS_KEY")
 
+# 티스토리 설정
 TISTORY_IT_BLOG_NAME = env("TISTORY_IT_BLOG_NAME") or "aaroneom"
 TISTORY_FAMILY_BLOG_NAME = env("TISTORY_FAMILY_BLOG_NAME") or "lhimepapa"
 TISTORY_COOKIES_JSON = env("TISTORY_COOKIES_JSON")
 
+# Blogger API 설정
 BLOGGER_ID = env("BLOGGER_ID")
 BLOGGER_TOKEN_JSON = env("BLOGGER_TOKEN_JSON")
 BLOGGER_TOKEN_PATH = "token.json"
 
+# WordPress API 설정
 WORDPRESS_URL = (env("WORDPRESS_URL") or "").rstrip("/")
 WORDPRESS_USER = env("WORDPRESS_USER")
 WORDPRESS_APP_PASS = env("WORDPRESS_APP_PASS")
 
+# Velog API 설정
 VELOG_ACCESS_TOKEN = env("VELOG_ACCESS_TOKEN")
 VELOG_REFRESH_TOKEN = env("VELOG_REFRESH_TOKEN")
 
@@ -79,7 +92,7 @@ client = genai.Client(
 # ---------------------------------------------------------
 # 1. 스마트 모델 폴백 호출기 (429 / 503 자동 방어)
 # ---------------------------------------------------------
-def call_gemini_smart(contents, use_search=False):
+def call_gemini_smart(contents, use_search=True):
     cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]) if use_search else None
     last_err = None
     for model_name in dict.fromkeys(MODEL_CANDIDATES):
@@ -91,7 +104,7 @@ def call_gemini_smart(contents, use_search=False):
                 msg = str(e)
                 if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                     log.warning("   ⚠️ [%s] 일일/분당 한도 초과 → 다음 모델로 즉시 전환", model_name)
-                    break  # 다음 모델로 이동
+                    break
                 log.warning("   ⚠️ [%s] 일시 오류 재시도 (%d/2): %s", model_name, attempt + 1, msg[:120])
                 time.sleep(3)
     raise last_err
@@ -209,13 +222,14 @@ def get_image(en_keyword):
 
 
 # ---------------------------------------------------------
-# 3. 3가지 핵심 카테고리 (1회 호출로 한국어+영어 동시 생성 -> API 쿼터 50% 절약)
+# 3. 3가지 핵심 카테고리 (1회 호출로 한국어+영어 동시 생성)
 # ---------------------------------------------------------
 POST_CATEGORIES = {
     "it_news": {
         "name": "1. 오늘의 Tech Top 10 & 전문가 논평",
         "tistory_blog": TISTORY_IT_BLOG_NAME,
         "allow_velog": True,
+        "use_search": True,
         "tags_ko": ["오늘의테크뉴스", "IT트렌드", "글로벌IT이슈", "테크논평", "AI뉴스"],
         "tags_en": ["TechNews", "TechTop10", "ITInsights", "GlobalTech", "EnterpriseIT"],
         "prompt": f"""
@@ -236,6 +250,7 @@ Google 검색 도구를 사용해 **오늘({TODAY_KO}, 2026년 기준) 전 세�
         "name": "2. 초보자·아이 눈높이 최신 테크 상식",
         "tistory_blog": TISTORY_IT_BLOG_NAME,
         "allow_velog": True,
+        "use_search": True,
         "tags_ko": ["테크상식", "쉬운IT", "IT용어정리", "반도체기초", "초보자가이드"],
         "tags_en": ["TechExplained", "TechBasics", "EasyIT", "FutureTech", "TechGlossary"],
         "prompt": """
@@ -257,6 +272,7 @@ Google 검색을 참고하여 **요즘 테크 업계에서 핫하게 떠오르�
         "name": "3. 7살 딸·5살 아들 아빠의 주말 나들이 정복기",
         "tistory_blog": TISTORY_FAMILY_BLOG_NAME,
         "allow_velog": False,
+        "use_search": True,
         "tags_ko": ["주말나들이", "아이와가볼만한곳", "가족여행", "남매육아", "주말코스추천"],
         "tags_en": ["KoreaFamilyTravel", "KidsActivitiesKorea", "WeekendTripKorea", "FamilyOuting", "TravelWithKids"],
         "prompt": """
@@ -278,7 +294,6 @@ Google 검색을 활용해 대한민국에서 **7살·5살 남매와 함께 주�
 
 
 def generate_bilingual_posts(category_key):
-    """단 1회의 API 호출로 한국어(KO)와 영어(EN) 포스팅을 동시에 생성하여 API 한도를 절반으로 아낍니다."""
     cat = POST_CATEGORIES[category_key]
     prompt = f"""
 {cat['prompt']}
@@ -300,7 +315,6 @@ TITLE: English Title
     raw = (resp.text or "").strip()
     raw = re.sub(r"\([^)]*확인\s*필요[^)]*\)", "", raw)
 
-    # KO / EN 블록 분리
     ko_part, en_part = raw, ""
     if "===EN_START===" in raw:
         parts = raw.split("===EN_START===", 1)
@@ -323,7 +337,6 @@ TITLE: English Title
     title_ko, md_ko_raw = parse_block(ko_part)
     title_en, md_en_raw = parse_block(en_part) if en_part else ("", "")
 
-    # 이미지 생성 (2장만 생성해 KO와 EN 본문에 동일하게 삽입)
     img_tags = re.findall(r"\[IMG:\s*(.+?)\]", md_ko_raw)
     resolved_imgs = []
     for kw in img_tags[:2]:
@@ -362,7 +375,7 @@ def md_to_styled_html(md_text):
 
 
 # ---------------------------------------------------------
-# 4. 티스토리 웹 자동화 (CodeMirror + React 상태 강제 동기화)
+# 4. 티스토리 웹 자동화 (TinyMCE 직접 본문 삽입 + HTML/WYSIWYG 복귀 2중 안전장치)
 # ---------------------------------------------------------
 def init_headless_driver():
     options = webdriver.ChromeOptions()
@@ -417,58 +430,67 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
     title_inp.send_keys(strip_non_bmp(title))
     time.sleep(0.5)
 
-    # 2. HTML 모드로 전환
-    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-layer-btn-open"))).click()
-    time.sleep(0.5)
-    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-html"))).click()
-    time.sleep(1)
-    try:
-        driver.switch_to.alert.accept()
-    except NoAlertPresentException:
-        pass
-    time.sleep(1)
-
-    # 3. CodeMirror 에 HTML 주입 + 변경 이벤트 강제 발생
     safe_html = strip_non_bmp(html_body)
-    n = driver.execute_script(
+
+    # 2. [방법 A] 기본모드(TinyMCE) 에디터 인스턴스에 직접 HTML 본문 삽입
+    injected = driver.execute_script(
         """
-        var cmEl = document.querySelector('.CodeMirror');
-        if (!cmEl || !cmEl.CodeMirror) return -1;
-        var cm = cmEl.CodeMirror;
-        cm.setValue(arguments[0]);
-        cm.save();
-        var ta = cm.getTextArea();
-        if (ta) {
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-            ta.dispatchEvent(new Event('change', { bubbles: true }));
+        if (window.tinymce && tinymce.activeEditor) {
+            tinymce.activeEditor.setContent(arguments[0]);
+            tinymce.activeEditor.fire('change');
+            tinymce.activeEditor.save();
+            return tinymce.activeEditor.getContent().length;
         }
-        return cm.getValue().length;
+        return -1;
         """,
         safe_html,
     )
-    if n is None or n <= 0:
-        raise RuntimeError("티스토리 HTML 에디터(CodeMirror) 주입 실패")
-    log.info("   📝 HTML 코드 주입 및 이벤트 동기화 완료: %d자", n)
-    time.sleep(1)
 
-    # 4. 기본모드로 안전 복귀 (모드 전환 버튼 텍스트/셀렉터 유연하게 탐색)
-    try:
-        mode_btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-layer-btn-open")))
-        mode_btn.click()
+    if injected and injected > 0:
+        log.info("   📝 TinyMCE 에디터 직접 본문 주입 성공: %d자", injected)
+    else:
+        # 3. [방법 B - 폴백] HTML 모드 진입 → CodeMirror 주입 → 기본모드 복귀
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-layer-btn-open"))).click()
         time.sleep(0.5)
-        wysiwyg_btn = driver.find_element(By.XPATH, "//div[@id='editor-mode-layer']//div[contains(., '기본모드')] | //*[@id='editor-mode-wysiwyg']")
-        wysiwyg_btn.click()
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-html"))).click()
         time.sleep(1)
         try:
             driver.switch_to.alert.accept()
         except NoAlertPresentException:
             pass
-        log.info("   🔄 기본모드(WYSIWYG) 동기화 완료")
         time.sleep(1)
-    except Exception as e:
-        log.info("   ℹ️ 기본모드 복귀 스킵 (HTML 모드 유지 발행 진행): %s", str(e)[:60])
 
-    # 5. 태그 입력
+        n = driver.execute_script(
+            """
+            var cmEl = document.querySelector('.CodeMirror');
+            if (!cmEl || !cmEl.CodeMirror) return -1;
+            cmEl.CodeMirror.setValue(arguments[0]);
+            cmEl.CodeMirror.save();
+            return cmEl.CodeMirror.getValue().length;
+            """,
+            safe_html,
+        )
+        log.info("   📝 HTML 코드 주입: %d자", n)
+        time.sleep(0.5)
+
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-layer-btn-open"))).click()
+        time.sleep(0.5)
+        driver.execute_script(
+            """
+            var el = document.querySelector('#editor-mode-wysiwyg')
+                  || document.querySelector('#editor-mode-layer [id*="wysiwyg"]')
+                  || document.querySelector('#editor-mode-layer li:first-child, #editor-mode-layer div[role="menuitem"]:first-child');
+            if (el) el.click();
+            """
+        )
+        time.sleep(1)
+        try:
+            driver.switch_to.alert.accept()
+        except NoAlertPresentException:
+            pass
+        time.sleep(1)
+
+    # 4. 태그 입력
     try:
         tag_inp = driver.find_element(By.CSS_SELECTOR, "#tagText")
         for t in tags[:5]:
@@ -478,7 +500,7 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
     except Exception:
         pass
 
-    # 6. 발행 버튼 클릭
+    # 5. 발행 버튼 클릭
     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#publish-layer-btn"))).click()
     time.sleep(1)
     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#open20"))).click()
