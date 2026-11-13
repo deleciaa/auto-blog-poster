@@ -30,7 +30,9 @@ jobs:
         run: python auto_blog_poster.py --platforms api
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}   # 선택 (없으면 Openverse 사용)
+          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}   # 선택
+          OPENVERSE_CLIENT_ID: ${{ secrets.OPENVERSE_CLIENT_ID }}   # 선택 (Openverse 403 이면 등록)
+          OPENVERSE_CLIENT_SECRET: ${{ secrets.OPENVERSE_CLIENT_SECRET }}
           BLOGGER_ID: ${{ secrets.BLOGGER_ID }}
           WORDPRESS_URL: ${{ secrets.WORDPRESS_URL }}
           WORDPRESS_USER: ${{ secrets.WORDPRESS_USER }}
@@ -44,3 +46,19 @@ jobs:
         with:
           name: logs
           path: logs/
+
+# ---------------------------------------------------------------------------
+# [선택] 티스토리/네이버/브런치도 Actions 에서 돌리고 싶다면: '내 Windows PC' 를 self-hosted runner 로 등록하고
+# 아래 job 을 추가하세요. (PC 가 켜져 있고 로그인된 상태여야 함 / 먼저 PC 에서 --login-setup 1회 필요)
+#
+#  post-web:
+#    runs-on: [self-hosted, windows]
+#    steps:
+#      - uses: actions/checkout@v4
+#      - run: pip install google-genai requests markdown selenium
+#      - run: python auto_blog_poster.py --platforms web
+#        env:
+#          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+#          TISTORY_BLOG_NAME: ${{ secrets.TISTORY_BLOG_NAME }}
+#          NAVER_BLOG_ID: ${{ secrets.NAVER_BLOG_ID }}
+#          CHROME_USER_DATA_PATH: C:/Chrome_Dev_Profile
