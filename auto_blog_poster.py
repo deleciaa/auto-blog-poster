@@ -12,7 +12,8 @@
     python auto_blog_poster.py --platforms tistory          # 하나만
     python auto_blog_poster.py --login-setup                # (내 PC 최초 1회) 크롬 프로필에 로그인 저장
 
-이미지: UNSPLASH_ACCESS_KEY 가 있으면 우선 사용, 없어도 Openverse(키 없이 사용 가능)로 검색.
+이미지: UNSPLASH_ACCESS_KEY(선택) → Openverse → Wikimedia Commons 순으로 검색 (모두 상업적 이용 가능한 이미지만).
+        Openverse 가 403 이면 OPENVERSE_CLIENT_ID/SECRET 을 등록하세요 (Wikimedia 는 키 불필요).
         PEXELS_API_KEY 는 예전에 발급받은 키가 있을 때만 보조로 사용 (신규 발급은 중단됨).
 로그:   콘솔 + ./logs/run_*.log 에 저장. Selenium 실패 시 ./logs/fail_*.png/.html 로 화면도 저장.
 """
@@ -211,17 +212,47 @@ def _search_openverse(q, lang):
     tok = _openverse_token()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
-    r = requests.get("https://api.openverse.org/v1/images/", headers=headers,
-                     params={"q": q, "page_size": 10, "license_type": "commercial",
-                             "category": "photograph", "mature": "false"}, timeout=15)
-    if r.status_code == 429:
-        raise RuntimeError("Openverse 요청 한도 초과(429)")
+    base = {"q": q, "page_size": 10, "license_type": "commercial", "mature": "false"}
+    for extra in ({"category": "photograph"}, {}):      # 사진만 → 결과 없으면 조건 완화
+        r = requests.get("https://api.openverse.org/v1/images/", headers=headers,
+                         params={**base, **extra}, timeout=15)
+        if r.status_code == 429:
+            raise RuntimeError("Openverse 요청 한도 초과(429)")
+        if r.status_code in (401, 403):
+            raise RuntimeError("Openverse 접근 거부(%d): 익명 접근이 막혔습니다. "
+                               "OPENVERSE_CLIENT_ID / OPENVERSE_CLIENT_SECRET 을 등록하세요." % r.status_code)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        for p in results:
+            url = p.get("url")
+            if url:
+                credit = p.get("attribution") or f"{p.get('creator', '')} / {str(p.get('license', '')).upper()} (Openverse)"
+                yield url, credit, None
+        if results:
+            return
+
+
+def _search_wikimedia(q, lang):
+    """Wikimedia Commons: 키 없이 사용 가능, CC/퍼블릭도메인 파일만 사용."""
+    ua = "auto-blog-poster/1.0 (personal blog automation)"
+    r = requests.get("https://commons.wikimedia.org/w/api.php", headers={"User-Agent": ua}, timeout=15, params={
+        "action": "query", "generator": "search", "gsrnamespace": 6, "gsrsearch": f"{q} filetype:bitmap",
+        "gsrlimit": 10, "prop": "imageinfo", "iiprop": "url|extmetadata|mime", "iiurlwidth": 1200,
+        "format": "json", "origin": "*"})
     r.raise_for_status()
-    for p in r.json().get("results", []):
-        url = p.get("url")
+    pages = (r.json().get("query") or {}).get("pages", {})
+    for p in sorted(pages.values(), key=lambda x: x.get("index", 0)):
+        ii = (p.get("imageinfo") or [{}])[0]
+        if ii.get("mime") not in ("image/jpeg", "image/png"):
+            continue
+        meta = ii.get("extmetadata", {})
+        lic = meta.get("LicenseShortName", {}).get("value", "")
+        if not (lic.upper().startswith("CC") or "public domain" in lic.lower() or lic.upper().startswith("PD")):
+            continue
+        url = ii.get("thumburl") or ii.get("url")
+        artist = re.sub(r"<[^>]+>", "", meta.get("Artist", {}).get("value", "")).strip() or "Wikimedia Commons"
         if url:
-            credit = p.get("attribution") or f"{p.get('creator', '')} / {str(p.get('license', '')).upper()} (Openverse)"
-            yield url, credit, None
+            yield url, f"{artist} / {lic} (Wikimedia Commons)", None
 
 
 def _search_pexels(q, lang):
@@ -239,7 +270,8 @@ def image_providers():
     p = []
     if UNSPLASH_ACCESS_KEY:
         p.append(("unsplash", _search_unsplash))
-    p.append(("openverse", _search_openverse))          # 키 없이도 사용 가능
+    p.append(("openverse", _search_openverse))          # 키 없이도 시도 (403 이면 CLIENT_ID/SECRET 필요)
+    p.append(("wikimedia", _search_wikimedia))          # 키 불필요
     if PEXELS_API_KEY:
         p.append(("pexels", _search_pexels))
     return p
@@ -252,12 +284,18 @@ def get_image(query):
     en = _to_english_query(query)
     if en:
         queries.append((en, "en-US"))
+        words = en.split()
+        if len(words) > 2:                                # 결과가 없으면 검색어를 더 단순하게
+            queries.append((" ".join(words[:2]), "en-US"))
+        if len(words) > 1:
+            queries.append((words[-1], "en-US"))
     log.info("   🖼 이미지 검색: '%s' (영문: %s)", query, en)
 
+    dead = set()                                          # 접근 거부된 공급자는 이번 실행에서 건너뜀
     for q, lang in queries:
         for name, fn in providers:
-            if name == "unsplash" and lang.startswith("ko"):
-                continue                      # Unsplash 는 영어 검색만 효과적
+            if name in dead or (name == "unsplash" and lang.startswith("ko")):
+                continue
             try:
                 n = 0
                 for url, credit, track in fn(q, lang):
@@ -265,7 +303,7 @@ def get_image(query):
                     if url in _used_images or not _is_image(url):
                         continue
                     _used_images.add(url)
-                    if track:                 # Unsplash 가이드라인: 사용 시 download 트리거
+                    if track:                             # Unsplash 가이드라인: 사용 시 download 트리거
                         try:
                             requests.get(track, headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}, timeout=5)
                         except requests.RequestException:
@@ -275,6 +313,8 @@ def get_image(query):
                 log.info("   🖼 %s('%s'): 후보 %d개, 사용 가능한 이미지 없음", name, q, n)
             except Exception as e:
                 log.warning("   🖼 %s('%s') 실패: %s", name, q, e)
+                if "접근 거부" in str(e) or "한도 초과" in str(e):
+                    dead.add(name)
     log.warning("   🖼 이미지를 찾지 못해 생략: %s", query)
     return None
 
@@ -374,7 +414,8 @@ def post_to_wordpress(title, html_body):
 
 
 def post_to_velog(title, md_body):
-    """비공식 GraphQL API 라서 스키마가 바뀌면 깨질 수 있습니다."""
+    """비공식 GraphQL API 라서 스키마가 바뀌면 깨질 수 있습니다.
+    - writePost 의 meta 는 필수(JSON!) 인자: 빠지면 에러 없이 null 이 돌아옵니다."""
     if not VELOG_REFRESH_TOKEN:
         raise RuntimeError("VELOG_REFRESH_TOKEN 누락")
     cookie = f"refresh_token={VELOG_REFRESH_TOKEN}"
@@ -385,44 +426,38 @@ def post_to_velog(title, md_body):
     log.info("   velog 쿠키: refresh_token(%d자)%s", len(VELOG_REFRESH_TOKEN),
              f", access_token({len(VELOG_ACCESS_TOKEN)}자)" if VELOG_ACCESS_TOKEN else ", access_token 없음")
 
-    def gql(query, variables=None):
-        res = requests.post("https://v2.velog.io/graphql", json={"query": query, "variables": variables or {}},
-                            headers=headers, timeout=HTTP_TIMEOUT)
-        log.info("   velog HTTP %s", res.status_code)
-        try:
-            return res.json()
-        except ValueError:
-            raise RuntimeError(f"JSON 응답이 아님: HTTP {res.status_code} {res.text[:200]}")
-
-    username = None
-    me = gql("query { currentUser { id username } }")
-    if me.get("errors"):
-        log.warning("   velog 로그인 확인 쿼리 에러(무시하고 계속): %s", str(me["errors"])[:200])
-    else:
-        user = (me.get("data") or {}).get("currentUser")
-        if not user:
-            raise RuntimeError("벨로그 인증 실패(currentUser=null): refresh_token 이 만료/오타입니다. "
-                               "브라우저 쿠키(refresh_token, access_token)를 새로 복사해 시크릿을 갱신하세요.")
-        username = user.get("username")
-        log.info("   velog 로그인 확인: @%s", username)
-
     query = """
     mutation WritePost($title: String, $body: String, $tags: [String], $is_markdown: Boolean,
-                       $is_temp: Boolean, $is_private: Boolean, $url_slug: String) {
+                       $is_temp: Boolean, $is_private: Boolean, $url_slug: String, $meta: JSON!) {
         writePost(title: $title, body: $body, tags: $tags, is_markdown: $is_markdown,
-                  is_temp: $is_temp, is_private: $is_private, url_slug: $url_slug) {
+                  is_temp: $is_temp, is_private: $is_private, url_slug: $url_slug, meta: $meta) {
             id
             url_slug
+            user { username }
         }
     }
     """
     slug = re.sub(r"[^0-9a-zA-Z가-힣]+", "-", title).strip("-")[:60] + f"-{int(time.time())}"
     variables = {"title": title, "body": md_body, "tags": ["IT", "기술", "가족나들이"],
-                 "is_markdown": True, "is_temp": False, "is_private": False, "url_slug": slug}
-    j = gql(query, variables)
+                 "is_markdown": True, "is_temp": False, "is_private": False, "url_slug": slug, "meta": {}}
+    res = requests.post("https://v2.velog.io/graphql", json={"query": query, "variables": variables},
+                        headers=headers, timeout=HTTP_TIMEOUT)
+    log.info("   velog HTTP %s", res.status_code)
+    if "refresh_token=" in (res.headers.get("Set-Cookie") or ""):
+        log.warning("   velog 가 새 refresh_token 을 발급했습니다. 이후 인증 실패가 나면 쿠키를 다시 복사해 시크릿을 갱신하세요.")
+    try:
+        j = res.json()
+    except ValueError:
+        raise RuntimeError(f"JSON 응답이 아님: HTTP {res.status_code} {res.text[:200]}")
+
     post = (j.get("data") or {}).get("writePost")
-    if j.get("errors") or not post:
-        raise RuntimeError(f"writePost 실패: {str(j)[:300]}")
+    if j.get("errors"):
+        log.warning("   velog errors: %s", str(j["errors"])[:300])
+    if not post:
+        raise RuntimeError(
+            "벨로그가 빈 결과(null)를 돌려줬습니다. 가능한 원인: ① refresh_token 만료/오타 ② 필수 인자(meta 등) 누락/스키마 변경 "
+            f"③ 신규 계정의 봇 방지(Turnstile) 검사. 응답: {str(j)[:300]}")
+    username = ((post.get("user") or {}).get("username"))
     return f"https://velog.io/@{username}/{post.get('url_slug', slug)}" if username else f"slug={post.get('url_slug', slug)}"
 
 
@@ -641,6 +676,7 @@ def post_to_brunch(driver, title, plain_body):
 # 7. 설정 점검 / 실행 컨트롤러
 # ---------------------------------------------------------
 def check_config(targets):
+    """누락된 설정을 로그로 보여 주고 {플랫폼: [누락 항목]} 을 반환."""
     checks = {
         "blogger": [("BLOGGER_ID", bool(BLOGGER_ID)), (f"{BLOGGER_TOKEN_PATH} 파일", os.path.exists(BLOGGER_TOKEN_PATH))],
         "wordpress": [("WORDPRESS_URL", bool(WORDPRESS_URL)), ("WORDPRESS_USER", bool(WORDPRESS_USER)),
@@ -650,14 +686,17 @@ def check_config(targets):
         "naver": [("NAVER_BLOG_ID", bool(NAVER_BLOG_ID)), ("selenium 설치", SELENIUM_OK)],
         "brunch": [("selenium 설치", SELENIUM_OK)],
     }
+    missing_map = {}
     log.info("── 설정 점검 ──")
     for t in targets:
         missing = [n for n, ok in checks[t] if not ok]
         if missing:
-            log.warning("  ⚠️ %-10s 누락: %s", t, ", ".join(missing))
+            missing_map[t] = missing
+            log.warning("  ⚠️ %-10s 누락: %s  → 이번 실행에서는 건너뜁니다", t, ", ".join(missing))
         else:
             log.info("  ✅ %-10s 설정 확인", t)
     log.info("  🖼 이미지 검색: %s", " → ".join(n for n, _ in image_providers()))
+    return missing_map
 
 
 def expand_platforms(arg):
@@ -694,7 +733,7 @@ def main():
     log.info("대상 플랫폼: %s", ", ".join(targets) or "(없음)")
     if not client:
         raise SystemExit("GEMINI_API_KEY 가 설정되지 않았습니다.")
-    check_config(targets)
+    missing_map = check_config(targets)
 
     t0 = time.time()
     log.info("── 글 생성 ──")
@@ -713,6 +752,10 @@ def main():
     def run(name, fn, *a, driver=None):
         if name not in targets:
             return
+        if name in missing_map:
+            results[name] = ("SKIP", "설정 누락: " + ", ".join(missing_map[name]))
+            log.warning("⏭ %s 건너뜀 (%s)", name, results[name][1])
+            return
         log.info("── %s 게시 시작 ──", name)
         t = time.time()
         try:
@@ -728,7 +771,7 @@ def main():
     run("wordpress", post_to_wordpress, title, html_body)
     run("velog", post_to_velog, title, md_body)
 
-    if any(p in targets for p in WEB_PLATFORMS):
+    if any(p in targets and p not in missing_map for p in WEB_PLATFORMS):
         driver = None
         try:
             log.info("── 브라우저 시작 ──")
@@ -749,7 +792,8 @@ def main():
     for name in ALL_PLATFORMS:
         if name in results:
             status, info = results[name]
-            print(f"{'✅' if status == 'OK' else '❌'} {name:10s} {info}")
+            icon = {"OK": "✅", "FAIL": "❌", "SKIP": "⏭ "}[status]
+            print(f"{icon} {name:10s} {info}")
     print(f"\n상세 로그: {LOG_FILE}")
     if any(s == "FAIL" for s, _ in results.values()):
         sys.exit(1)
