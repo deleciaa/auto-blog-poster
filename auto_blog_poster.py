@@ -4,7 +4,7 @@ on:
   schedule:
     # 매일 한국시간 오전 8시 30분 (UTC 23:30) 자동 실행
     - cron: '30 23 * * *'
-  workflow_dispatch: # GitHub 웹에서 수동 실행 버튼 활성화
+  workflow_dispatch: # GitHub Actions 탭에서 수동 즉시 실행 버튼 활성화
 
 jobs:
   publish:
@@ -25,15 +25,16 @@ jobs:
         run: |
           pip install google-genai requests markdown google-api-python-client google-auth selenium
 
-      - name: Run Auto Blog Poster (3 Posts)
+      - name: Run Auto Blog Poster (aaroneom & lhimepapa)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TISTORY_BLOG_NAME: ${{ secrets.TISTORY_BLOG_NAME }}
+          TISTORY_IT_BLOG_NAME: aaroneom
+          TISTORY_FAMILY_BLOG_NAME: lhimepapa
           TISTORY_COOKIES_JSON: ${{ secrets.TISTORY_COOKIES_JSON }}
           BLOGGER_ID: ${{ secrets.BLOGGER_ID }}
           BLOGGER_TOKEN_JSON: ${{ secrets.BLOGGER_TOKEN_JSON }}
         run: |
-          python auto_blog_poster.py --platforms tistory,blogger
+          python auto_blog_poster.py --platforms tistory
 
       - name: Upload failure screenshots (if any)
         if: failure()
