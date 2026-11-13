@@ -296,7 +296,7 @@ TITLE: English Title
 - AI 번역투("새로운 지평", "결론적으로", "In conclusion", "delve into") 금지.
 - 가상의 화자 이름(김대현 등) 금지.
 """
-    resp = call_gemini_smart(prompt, use_search=cat["use_search"])
+    resp = call_gemini_smart(prompt, use_search=cat.get("use_search", True))
     raw = (resp.text or "").strip()
     raw = re.sub(r"\([^)]*확인\s*필요[^)]*\)", "", raw)
 
