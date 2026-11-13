@@ -57,9 +57,9 @@ log = logging.getLogger("autopost")
 env = os.environ.get
 GEMINI_API_KEY = env("GEMINI_API_KEY")
 MODEL_CANDIDATES = [
-    env("GEMINI_MODEL", "gemini-2.5-flash"),
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    env("GEMINI_MODEL", "gemini-3.8-flash"),
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 ]
 IMAGE_SOURCE = (env("IMAGE_SOURCE", "free_ai") or "free_ai").lower()
 UNSPLASH_ACCESS_KEY = env("UNSPLASH_ACCESS_KEY")
@@ -96,17 +96,18 @@ def call_gemini_smart(contents, use_search=True):
     cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]) if use_search else None
     last_err = None
     for model_name in dict.fromkeys(MODEL_CANDIDATES):
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return client.models.generate_content(model=model_name, contents=contents, config=cfg)
             except Exception as e:
                 last_err = e
                 msg = str(e)
-                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    log.warning("   ⚠️ [%s] 일일/분당 한도 초과 → 다음 모델로 즉시 전환", model_name)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "404" in msg:
+                    log.warning("   ⚠️ [%s] 한도 초과 또는 미지원 모델 → 다음 모델로 즉시 전환", model_name)
                     break
-                log.warning("   ⚠️ [%s] 일시 오류 재시도 (%d/2): %s", model_name, attempt + 1, msg[:120])
-                time.sleep(3)
+                wait_sec = 5 * (attempt + 1)
+                log.warning("   ⚠️ [%s] 일시 오류 (%d초 후 재시도 %d/3): %s", model_name, wait_sec, attempt + 1, msg[:100])
+                time.sleep(wait_sec)
     raise last_err
 
 
