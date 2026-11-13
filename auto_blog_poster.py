@@ -1,16 +1,18 @@
 """
-멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본
+멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본 (+ 텔레그램 발행 리포트)
 1. [it_news]     🌐 [오늘의 Tech Top 10] MM월 DD일 전 세계 IT·테크 핵심 뉴스 (+ 전문가 논평)
 2. [it_easy]     🌐 [테크 상식] "한줄 훅!" 최신 테크 키워드 쉽게 풀기
 3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기
 
 - 단 1회의 Gemini API 호출로 한국어(KO) + 영어(EN) 동시 생성 (일일 쿼터 50% 절약)
-- 429 한도 초과 시 대체 모델(gemini-2.5-flash-lite, gemini-2.0-flash) 자동 전환
+- 429 한도 초과 시 대체 모델 자동 전환
 - 티스토리(TinyMCE 직접 주입 + HTML/WYSIWYG 복귀 2중 안전장치), Blogger, WordPress, Velog 동시 발행
+- 발행 완료 후 총 건수, 플랫폼별 제목/링크, 실패 시 상세 사유 텔레그램 자동 보고
 """
 import os
 import re
 import sys
+import html
 import json
 import time
 import random
@@ -83,6 +85,10 @@ WORDPRESS_APP_PASS = env("WORDPRESS_APP_PASS")
 # Velog API 설정
 VELOG_ACCESS_TOKEN = env("VELOG_ACCESS_TOKEN")
 VELOG_REFRESH_TOKEN = env("VELOG_REFRESH_TOKEN")
+
+# 텔레그램 알림 설정
+TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
 
 client = genai.Client(
     api_key=GEMINI_API_KEY,
@@ -273,7 +279,7 @@ Google 검색을 참고하여 **요즘 테크 업계에서 핫하게 떠오르�
     "family_trip": {
         "name": "3. 7살 딸·5살 아들 아빠의 주말 나들이 정복기",
         "tistory_blog": TISTORY_FAMILY_BLOG_NAME,
-        "allow_velog": False,
+        "allow_velog": True,
         "use_search": True,
         "tags_ko": ["주말나들이", "아이와가볼만한곳", "가족여행", "남매육아", "주말코스추천"],
         "tags_en": ["KoreaFamilyTravel", "KidsActivitiesKorea", "WeekendTripKorea", "FamilyOuting", "TravelWithKids"],
@@ -580,7 +586,63 @@ def post_to_velog(title, md_body, tags):
 
 
 # ---------------------------------------------------------
-# 6. 메인 컨트롤러
+# 6. 텔레그램 발행 리포트 발송기
+# ---------------------------------------------------------
+def send_telegram_report(results, target_count=18):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("⚠️ 텔레그램 환경변수(TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) 누락으로 리포트 전송을 건너뜁니다.")
+        return
+
+    ok_items = [v for v in results.values() if v["status"] == "OK"]
+    fail_items = [v for v in results.values() if v["status"] == "FAIL"]
+
+    lines = [
+        f"📊 <b>[{TODAY_KO}] 블로그 자동 발행 리포트</b>",
+        f"✅ 성공: <b>{len(ok_items)}건</b> / ❌ 실패: <b>{len(fail_items)}건</b> (목표: {target_count}건)",
+        ""
+    ]
+
+    platform_groups = {}
+    for item in results.values():
+        platform_groups.setdefault(item["platform"], []).append(item)
+
+    for platform, items in platform_groups.items():
+        ok_cnt = sum(1 for i in items if i["status"] == "OK")
+        lines.append(f"<b>▸ {html.escape(platform)} ({ok_cnt}/{len(items)})</b>")
+        for it in items:
+            safe_title = html.escape(it["title"])
+            if it["status"] == "OK":
+                lines.append(f"  ✅ [{it['lang']}] <a href='{it['info']}'>{safe_title}</a>")
+            else:
+                safe_err = html.escape(str(it["info"])[:150])
+                lines.append(f"  ❌ [{it['lang']}] {safe_title}")
+                lines.append(f"      └ <i>사유: {safe_err}</i>")
+        lines.append("")
+
+    full_text = "\n".join(lines).strip()
+    chunks = [full_text[i:i + 3800] for i in range(0, len(full_text), 3800)]
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    for chunk in chunks:
+        try:
+            r = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=15,
+            )
+            r.raise_for_status()
+            log.info("📨 텔레그램 발행 리포트 전송 완료")
+        except Exception as e:
+            log.error("🚨 텔레그램 리포트 전송 실패: %s", e)
+
+
+# ---------------------------------------------------------
+# 7. 메인 컨트롤러
 # ---------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -610,7 +672,20 @@ def main():
             cat = POST_CATEGORIES[cat_key]
             log.info("\n==================================================")
             log.info("✍️  [%s] 한/영 듀얼 원고 생성 시작 (1회 호출 절약 모드)", cat["name"])
-            title_ko, md_ko, title_en, md_en = generate_bilingual_posts(cat_key)
+
+            try:
+                title_ko, md_ko, title_en, md_en = generate_bilingual_posts(cat_key)
+            except Exception as e:
+                log.error("🚨 [%s] 원고 생성(Gemini API) 실패: %s", cat["name"], e)
+                results[f"{cat_key}:gemini"] = {
+                    "platform": "Gemini 원고 생성",
+                    "lang": "KO/EN",
+                    "title": cat["name"],
+                    "status": "FAIL",
+                    "info": f"원고 생성 단계 실패: {str(e)}",
+                }
+                continue
+
             log.info("📌 [KO] 제목: %s (%d자)", title_ko, len(md_to_plain(md_ko)))
             if title_en:
                 log.info("📌 [EN] Title: %s (%d chars)", title_en, len(md_to_plain(md_en)))
@@ -627,40 +702,57 @@ def main():
                     continue
 
                 if "tistory" in targets and driver:
+                    p_label = f"티스토리 ({cat['tistory_blog']})"
                     try:
                         url = post_to_tistory(driver, cat["tistory_blog"], title, html_body, tags)
-                        results[f"{cat_key}[{lang_code}]:tistory({cat['tistory_blog']})"] = ("OK", url)
+                        results[f"{cat_key}[{lang_code}]:tistory({cat['tistory_blog']})"] = {
+                            "platform": p_label, "lang": lang_code, "title": title, "status": "OK", "info": url
+                        }
                         log.info("✅ [티스토리:%s][%s] 발행 완료", cat["tistory_blog"], lang_code)
                     except Exception as e:
-                        results[f"{cat_key}[{lang_code}]:tistory({cat['tistory_blog']})"] = ("FAIL", str(e))
+                        results[f"{cat_key}[{lang_code}]:tistory({cat['tistory_blog']})"] = {
+                            "platform": p_label, "lang": lang_code, "title": title, "status": "FAIL", "info": str(e)
+                        }
                         log.error("❌ [티스토리:%s][%s] 실패: %s", cat["tistory_blog"], lang_code, e)
                         driver.save_screenshot(os.path.join(LOG_DIR, f"fail_tistory_{cat_key}_{lang_code}.png"))
 
                 if "blogger" in targets and BLOGGER_ID:
                     try:
                         url = post_to_blogger(title, html_body, tags)
-                        results[f"{cat_key}[{lang_code}]:blogger"] = ("OK", url)
+                        results[f"{cat_key}[{lang_code}]:blogger"] = {
+                            "platform": "Blogger", "lang": lang_code, "title": title, "status": "OK", "info": url
+                        }
                         log.info("✅ [Blogger][%s] 발행 완료: %s", lang_code, url)
                     except Exception as e:
-                        results[f"{cat_key}[{lang_code}]:blogger"] = ("FAIL", str(e))
+                        results[f"{cat_key}[{lang_code}]:blogger"] = {
+                            "platform": "Blogger", "lang": lang_code, "title": title, "status": "FAIL", "info": str(e)
+                        }
                         log.error("❌ [Blogger][%s] 실패: %s", lang_code, e)
 
                 if "wordpress" in targets and WORDPRESS_URL:
                     try:
                         url = post_to_wordpress(title, html_body)
-                        results[f"{cat_key}[{lang_code}]:wordpress"] = ("OK", url)
+                        results[f"{cat_key}[{lang_code}]:wordpress"] = {
+                            "platform": "WordPress", "lang": lang_code, "title": title, "status": "OK", "info": url
+                        }
                         log.info("✅ [WordPress][%s] 발행 완료: %s", lang_code, url)
                     except Exception as e:
-                        results[f"{cat_key}[{lang_code}]:wordpress"] = ("FAIL", str(e))
+                        results[f"{cat_key}[{lang_code}]:wordpress"] = {
+                            "platform": "WordPress", "lang": lang_code, "title": title, "status": "FAIL", "info": str(e)
+                        }
                         log.error("❌ [WordPress][%s] 실패: %s", lang_code, e)
 
                 if "velog" in targets and cat["allow_velog"] and VELOG_REFRESH_TOKEN:
                     try:
                         url = post_to_velog(title, md_body, tags)
-                        results[f"{cat_key}[{lang_code}]:velog"] = ("OK", url)
+                        results[f"{cat_key}[{lang_code}]:velog"] = {
+                            "platform": "Velog", "lang": lang_code, "title": title, "status": "OK", "info": url
+                        }
                         log.info("✅ [Velog][%s] 발행 완료: %s", lang_code, url)
                     except Exception as e:
-                        results[f"{cat_key}[{lang_code}]:velog"] = ("FAIL", str(e))
+                        results[f"{cat_key}[{lang_code}]:velog"] = {
+                            "platform": "Velog", "lang": lang_code, "title": title, "status": "FAIL", "info": str(e)
+                        }
                         log.error("❌ [Velog][%s] 실패: %s", lang_code, e)
 
                 time.sleep(6)
@@ -670,9 +762,12 @@ def main():
 
     if not args.dry_run:
         print("\n===== 최종 멀티 플랫폼 & 한/영 발행 요약 =====")
-        for k, (status, info) in results.items():
-            print(f"{'✅' if status == 'OK' else '❌'} {k:38s} -> {info}")
-        if any(s == "FAIL" for s, _ in results.values()):
+        for k, item in results.items():
+            print(f"{'✅' if item['status'] == 'OK' else '❌'} {k:38s} -> {item['info']}")
+
+        send_telegram_report(results, target_count=18)
+
+        if any(item["status"] == "FAIL" for item in results.values()):
             sys.exit(1)
 
 
