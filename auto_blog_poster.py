@@ -7,7 +7,7 @@
 - 단 1회의 Gemini API 호출로 한국어(KO) + 영어(EN) 동시 생성 (일일 쿼터 50% 절약)
 - 429 한도 초과 시 대체 모델 자동 전환
 - 티스토리(쿠키 딕셔너리/리스트 2중 호환 + TinyMCE 직접 주입 + HTML/WYSIWYG 복귀), Blogger, WordPress, Velog 동시 발행
-- DuckDuckGo 기반 실제 나들이 현장 사진 자동 검색 폴백 탑재
+- DuckDuckGo(ddgs) 및 무료 AI 이미지 기반 실제 현장/장소/기술 사진 정밀 검색 폴백 탑재
 - 발행 완료 후 총 건수, 플랫폼별 제목/링크, 실패 시 상세 사유 텔레그램 자동 보고
 """
 import os
@@ -38,7 +38,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoAlertPresentException
 
-from duckduckgo_search import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        DDGS = None
 
 # ---------------------------------------------------------
 # 0. 날짜(한국시간 기준) 및 환경 설정
@@ -143,7 +149,7 @@ def md_to_plain(md_text):
 
 
 # ---------------------------------------------------------
-# 2. 무료 AI 이미지 + DuckDuckGo 실제 사진 + 스톡 폴백
+# 2. 무료 AI 이미지 + DuckDuckGo(ddgs) 정밀 사진 + 스톡 폴백
 # ---------------------------------------------------------
 _used_images = set()
 
@@ -173,93 +179,111 @@ def get_free_ai_image(en_prompt):
 
 
 def _search_duckduckgo(q):
+    if not DDGS:
+        return None
     try:
-        log.info("   🔍 DuckDuckGo 실제 사진 검색: '%s'", q)
+        search_query = q if len(q.split()) > 1 else f"Korea {q}"
+        log.info("   🔍 DuckDuckGo 실제 정밀 사진 검색: '%s'", search_query)
         with DDGS() as ddgs:
-            results = list(ddgs.images(q, max_results=8))
+            results = list(ddgs.images(search_query, max_results=8))
             for r in results:
                 url = r.get("image")
                 if url and url not in _used_images and _is_image_reachable(url):
                     _used_images.add(url)
                     return url, f"Real Photo ({q} via DuckDuckGo)"
     except Exception as e:
-        log.warning("   ⚠️ DuckDuckGo 이미지 검색 실패: %s", e)
+        log.warning("   ⚠️ DuckDuckGo 이미지 검색 제한(RateLimit) 또는 에러 발생: %s", e)
     return None
 
 
 def _search_unsplash(q):
     if not UNSPLASH_ACCESS_KEY:
         return None
-    r = requests.get(
-        "https://api.unsplash.com/search/photos",
-        headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}", "Accept-Version": "v1"},
-        params={"query": q, "per_page": 5, "orientation": "landscape"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    for p in r.json().get("results", []):
-        url = p.get("urls", {}).get("regular")
-        if url and url not in _used_images:
-            _used_images.add(url)
-            return url, f"Photo by {p.get('user', {}).get('name', 'Creator')} on Unsplash"
+    try:
+        r = requests.get(
+            "https://api.unsplash.com/search/photos",
+            headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}", "Accept-Version": "v1"},
+            params={"query": q, "per_page": 5, "orientation": "landscape"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        for p in r.json().get("results", []):
+            url = p.get("urls", {}).get("regular")
+            if url and url not in _used_images:
+                _used_images.add(url)
+                return url, f"Photo by {p.get('user', {}).get('name', 'Creator')} on Unsplash"
+    except Exception:
+        pass
     return None
 
 
 def _search_wikimedia(q):
-    r = requests.get(
-        "https://commons.wikimedia.org/w/api.php",
-        headers={"User-Agent": "auto-blog-poster/1.0"},
-        timeout=12,
-        params={
-            "action": "query", "generator": "search", "gsrnamespace": 6,
-            "gsrsearch": f"{q} filetype:bitmap", "gsrlimit": 8,
-            "prop": "imageinfo", "iiprop": "url|extmetadata|mime",
-            "iiurlwidth": 1200, "format": "json", "origin": "*",
-        },
-    )
-    r.raise_for_status()
-    pages = (r.json().get("query") or {}).get("pages", {})
-    words = [w.lower() for w in q.split() if len(w) > 3]
-    for p in sorted(pages.values(), key=lambda x: x.get("index", 0)):
-        ii = (p.get("imageinfo") or [{}])[0]
-        if ii.get("mime") not in ("image/jpeg", "image/png"):
-            continue
-        meta = ii.get("extmetadata", {})
-        lic = meta.get("LicenseShortName", {}).get("value", "")
-        if not (lic.upper().startswith("CC") or "public domain" in lic.lower()):
-            continue
-        url = ii.get("thumburl") or ii.get("url")
-        title_clean = p.get("title", "").lower()
-        if url and url not in _used_images and any(w in title_clean for w in words):
-            _used_images.add(url)
-            return url, f"Wikimedia Commons ({lic})"
+    try:
+        r = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            headers={"User-Agent": "auto-blog-poster/1.0"},
+            timeout=12,
+            params={
+                "action": "query", "generator": "search", "gsrnamespace": 6,
+                "gsrsearch": f"{q} filetype:bitmap", "gsrlimit": 8,
+                "prop": "imageinfo", "iiprop": "url|extmetadata|mime",
+                "iiurlwidth": 1200, "format": "json", "origin": "*",
+            },
+        )
+        r.raise_for_status()
+        pages = (r.json().get("query") or {}).get("pages", {})
+        words = [w.lower() for w in q.split() if len(w) > 3]
+        for p in sorted(pages.values(), key=lambda x: x.get("index", 0)):
+            ii = (p.get("imageinfo") or [{}])[0]
+            if ii.get("mime") not in ("image/jpeg", "image/png"):
+                continue
+            meta = ii.get("extmetadata", {})
+            lic = meta.get("LicenseShortName", {}).get("value", "")
+            if not (lic.upper().startswith("CC") or "public domain" in lic.lower()):
+                continue
+            url = ii.get("thumburl") or ii.get("url")
+            title_clean = p.get("title", "").lower()
+            if url and url not in _used_images and any(w in title_clean for w in words):
+                _used_images.add(url)
+                return url, f"Wikimedia Commons ({lic})"
+    except Exception:
+        pass
     return None
 
 
 def get_image(en_keyword):
     if IMAGE_SOURCE == "none":
         return None
+    
+    # 1순위: 안정적인 무료 AI 이미지 생성 (Rate Limit 완전 회피)
     if IMAGE_SOURCE == "free_ai":
         try:
             return get_free_ai_image(en_keyword)
         except Exception as e:
-            log.warning("   ⚠️ 무료 AI 이미지 실패 → 실제 웹 사진(DuckDuckGo) 검색 전환: %s", e)
+            log.warning("   ⚠️ 무료 AI 이미지 실패 → 웹 실제 사진(DuckDuckGo) 검색 시도: %s", e)
     
-    for fn in (_search_duckduckgo, _search_unsplash, _search_wikimedia):
+    # 2순위: DuckDuckGo 실제 정밀 사진 검색
+    try:
+        res = _search_duckduckgo(en_keyword)
+        if res:
+            return res
+    except Exception:
+        pass
+
+    # 3순위: Unsplash / Wikimedia 폴백
+    for fn in (_search_unsplash, _search_wikimedia):
         try:
             res = fn(en_keyword)
             if res:
                 return res
         except Exception:
             pass
+            
     return None
 
 
 # ---------------------------------------------------------
-# 3. 3가지 핵심 카테고리 (1회 호출로 한국어+영어 동시 생성)
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# 3. 3가지 핵심 카테고리 (매일 새롭고 다양한 주제/장소 자동 탐색)
+# 3. 3가지 핵심 카테고리 (내용과 완벽히 일치하는 이미지 태그 강제 생성)
 # ---------------------------------------------------------
 POST_CATEGORIES = {
     "it_news": {
@@ -271,16 +295,18 @@ POST_CATEGORIES = {
         "tags_en": ["TechNews", "TechTop10", "ITInsights", "GlobalTech", "EnterpriseIT"],
         "prompt": f"""
 당신은 글로벌 IT 인프라·클라우드·네트워크 업계에서 14년 넘게 현장을 뛰어온 IT 전문가입니다.
-Google 검색 도구를 사용하여 **오늘({TODAY_KO}, 2026년 기준) 전 세계 및 한국 IT·테크 업계에서 실시간으로 가장 뜨겁게 보도되고 있는 신선하고 다양한 핵심 뉴스 10가지**를 검색해 선정하세요. (어제와 겹치지 않는 최신 이슈 위주)
+Google 검색 도구를 사용하여 오늘({TODAY_KO}, 2026년 기준) 전 세계 및 한국 IT·테크 업계에서 실시간으로 가장 뜨겁게 보도되고 있는 신선하고 다양한 핵심 뉴스 10가지와 전문가 논평을 작성하세요.
 
-[제목 형식]
-- 한국어 제목: `🌐 [오늘의 Tech Top 10] {TODAY_KO} 전 세계 IT·테크 핵심 뉴스`
-- 영어 제목: `🌐 [Today's Tech Top 10] {TODAY_EN}: Global IT & Tech News Highlights`
+[출력 형식 및 이미지 규칙]
+- 본문 중간에 `[IMG: 본문 속 핵심 기술명이나 기업명 및 제품명 (예: NVIDIA AI server rack, Samsung CXL memory)]` 형태의 태그를 정확히 2개 삽입하세요.
+- **절대로 추상적이거나 무관한 단어를 쓰지 말고, 본문에서 방금 다룬 실제 기업이나 기술 영문 명칭을 태그 안에 반드시 포함하세요.**
 
-[본문 구성 - 각 언어별 2,500자 이상 풍부하게]
-1. 짧은 오프닝: 오늘 글로벌 테크 시장의 전반적인 흐름 한 줄 요약.
-2. `## 오늘의 글로벌 Tech Top 10 핵심 브리핑` (영문: `## Today's Global Tech Top 10 Briefing`): 1번부터 10번까지 번호를 매겨 각 뉴스의 핵심 팩트와 한 줄 코멘트 정리.
-3. `## 현업 IT 전문가의 심층 논평` (영문: `## Industry Veteran's Deep-Dive Commentary`): 위 뉴스 중 가장 파급력이 큰 1~2가지 흐름이 기업 인프라와 비즈니스에 미칠 실질적 변화와 리스크 분석.
+===KO_START===
+TITLE: 한국어 제목
+(한국어 마크다운 본문 - [IMG: 구체적 기술명/기업명 영문] 태그 2개 포함)
+===EN_START===
+TITLE: English Title
+(영어 마크다운 본문 - 한국어와 동일한 위치에 동일한 [IMG: 구체적 기술명/기업명 영문] 태그 2개 포함)
 """
     },
     "it_easy": {
@@ -292,39 +318,40 @@ Google 검색 도구를 사용하여 **오늘({TODAY_KO}, 2026년 기준) 전 �
         "tags_en": ["TechExplained", "TechBasics", "EasyIT", "FutureTech", "TechGlossary"],
         "prompt": f"""
 당신은 복잡한 최신 IT·반도체·AI 기술을 초등학생 아이와 비전공자도 단번에 이해할 수 있도록 재미있게 풀어내는 IT 스토리텔러입니다.
-Google 검색을 활용하여 **최근 테크 및 과학계에서 새롭게 주목받고 있는 신기술 또는 트렌드 키워드 1가지**를 매일 다르게 선정하세요. (예컨대 AI 에이전트, 차세대 배터리, 유연 전자소자, 자율주행 기술, 신소재, 반도체, AI 등 매번 다른 신선한 주제 선택)
+Google 검색을 활용하여 최근 테크 및 과학계에서 새롭게 주목받고 있는 신기술 또는 트렌드 키워드 1가지를 선정해 소개하세요.
 
-[제목 형식]
-- 한국어 제목: `🌐 [테크 상식] "재치있는 한줄 훅!" 새로운 기술명 (영문명)`
-- 영어 제목: `🌐 [Tech Explained] "Catchy Hook!" Technology Name`
+[출력 형식 및 이미지 규칙]
+- 본문 중간에 `[IMG: 해당 기술의 실제 명칭 및 관련 기기/웨이퍼 (예: glass substrate wafer, quantum computer processor)]` 형태의 태그를 정확히 2개 삽입하세요.
+- **선정된 기술의 실제 시각적 대상이 검색되도록 구체적인 영문 키워드를 작성하세요.**
 
-[본문 구성 - 각 언어별 2,200자 이상]
-1. 왜 요즘 다들 이 기술에 열광할까? (일상 속 불편함과 연결)
-2. 초등학생도 1분 만에 이해하는 핵심 비유 (직관적인 사물 비유 필수)
-3. 우리 생활은 어떻게 달라질까?
-4. 한눈에 정리하는 오늘의 테크 포인트 3줄 요약.
+===KO_START===
+TITLE: 한국어 제목
+(한국어 마크다운 본문 - [IMG: 구체적 기술 영문 키워드] 태그 2개 포함)
+===EN_START===
+TITLE: English Title
+(영어 마크다운 본문 - 한국어와 동일한 위치에 동일한 [IMG: 구체적 기술 영문 키워드] 태그 2개 포함)
 """
     },
     "family_trip": {
         "name": "3. 7살 딸·5살 아들 아빠의 주말 나들이 정복기",
         "tistory_blog": TISTORY_FAMILY_BLOG_NAME,
-        "allow_velog": True,
+        "allow_velog": False,  # 주말 나들이 글은 벨로그 미발행
         "use_search": True,
         "tags_ko": ["주말나들이", "아이와가볼만한곳", "가족여행", "남매육아", "주말코스추천"],
         "tags_en": ["KoreaFamilyTravel", "KidsActivitiesKorea", "WeekendTripKorea", "FamilyOuting", "TravelWithKids"],
         "prompt": f"""
-당신은 7살 딸과 5살 아들을 키우는 현실 육아 아빠입니다.
-Google 검색(인스타그램, 블로그, 여행 정보 등 웹상의 실제 후기 반영)을 활용하여 대한민국에서 **7살·5살 남매와 함께 주말에 다녀오기 좋은, 매일 완전히 새롭고 다양한 실제 나들이 명소 1~2곳(키즈카페, 동물원, 수영장, 낚시, 갯벌체험, 얼음낚시, 식물원, 박물관, 체험공간, 근교 수목원, 키즈 테마파크 등 매번 다른 장소)**을 검색해 선정하세요. 
+당신은 7살 딸과 5살 아들 아빠입니다. 대한민국에서 7살·5살 남매와 함께 주말에 다녀오기 좋은 실제 나들이 명소 1~2곳을 선정해 실전 정복기를 작성하세요.
 
-[제목 형식]
-- 한국어 제목: `[주말 나들이] "매력적인 한줄 훅" + 7살 딸, 5살 아들과 함께한 [실제 검색된 새로운 장소명] 정복기`
-- 영어 제목: `[Weekend Outing in Korea] "Catchy Hook" + Exploring [Place Name] with a 7yo Daughter & 5yo Son`
+[출력 형식 및 이미지 규칙]
+- 본문 중간에 `[IMG: 실제 장소명 영문 + Korea (예: Lotte World Aquarium Seoul, Gwacheon National Science Museum)]` 형태의 태그를 정확히 2개 삽입하세요.
+- **절대로 추상적인 단어(family playing 등)를 쓰지 말고, 본문에서 소개한 실제 나들이 장소의 영문 이름과 'Korea'를 조합하여 태그를 만드세요.**
 
-[본문 구성 - 각 언어별 2,300자 이상]
-1. 7살 누나와 5살 동생, 둘 다 만족시킨 코스의 매력
-2. 그대로 따라 하는 반나절 실전 이동 동선 (시간대별 제안)
-3. 아빠가 직접 겪고 챙긴 현실 꿀팁 (주차장 위치, 예약 팁, 준비물)
-4. 아이들과 함께하기 좋은 근처 식사 & 휴식 팁.
+===KO_START===
+TITLE: 한국어 제목
+(한국어 마크다운 본문 - [IMG: 실제 장소명 영문 + Korea] 태그 2개 포함)
+===EN_START===
+TITLE: English Title
+(영어 마크다운 본문 - 한국어와 동일한 위치에 동일한 [IMG: 실제 장소명 영문 + Korea] 태그 2개 포함)
 """
     }
 }
@@ -335,15 +362,7 @@ def generate_bilingual_posts(category_key):
     prompt = f"""
 {cat['prompt']}
 
-[출력 형식 - 반드시 아래 구분자(===KO_START===, ===EN_START===)를 정확히 지켜서 출력하세요]
-===KO_START===
-TITLE: 한국어 제목
-(한국어 마크다운 본문 - 중간에 [IMG: 영문 묘사 3~6단어] 태그 2개 삽입)
-===EN_START===
-TITLE: English Title
-(자연스러운 영어 로컬라이징 마크다운 본문 - 한국어 본문과 동일한 위치에 동일한 [IMG: 영문 묘사 3~6단어] 태그 2개 삽입)
-
-[절대 금지]
+[절대 금지 사항]
 - 괄호형 메모 `(확인 필요)` 등 절대 출력 금지.
 - AI 번역투("새로운 지평", "결론적으로", "In conclusion", "delve into") 금지.
 - 가상의 화자 이름(김대현 등) 금지.
