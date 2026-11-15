@@ -1,9 +1,9 @@
 name: Auto Blog Poster (Multi-Platform KO/EN)
 
 on:
-  schedule:
-    - cron: '30 23 * * *'
-  workflow_dispatch:
+  repository_dispatch:
+    types: [auto-blog-poster]  # cron-job.org에서 호출할 이벤트 이름
+  workflow_dispatch:           # GitHub 웹화면 수동 실행 버튼 유지
 
 jobs:
   publish:
