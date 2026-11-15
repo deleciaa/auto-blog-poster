@@ -245,7 +245,6 @@ def get_image(en_keyword):
         except Exception as e:
             log.warning("   ⚠️ 무료 AI 이미지 실패 → 실제 웹 사진(DuckDuckGo) 검색 전환: %s", e)
     
-    # AI 이미지 실패 시 DuckDuckGo 실제 사진 검색 먼저 시도, 이후 Unsplash/Wikimedia 폴백
     for fn in (_search_duckduckgo, _search_unsplash, _search_wikimedia):
         try:
             res = fn(en_keyword)
@@ -367,8 +366,7 @@ TITLE: English Title
         if not title:
             title = re.sub(r"^[#*\s]+|[*\s]+$", "", lines[0])
             body_start = 1
-        return title, "
-".join(lines[body_start:]).strip()
+        return title, "\n".join(lines[body_start:]).strip()
 
     title_ko, md_ko_raw = parse_block(ko_part)
     title_en, md_en_raw = parse_block(en_part) if en_part else ("", "")
@@ -379,13 +377,7 @@ TITLE: English Title
         img = get_image(kw.strip())
         if img:
             url, credit = img
-            resolved_imgs.append(f"
-
-![{kw.strip()}]({url})
-
-*Image: {credit}*
-
-")
+            resolved_imgs.append(f"\n\n![{kw.strip()}]({url})\n\n*Image: {credit}*\n\n")
         else:
             resolved_imgs.append("")
 
@@ -443,7 +435,6 @@ def inject_cookies_for_domain(driver, target_url):
     driver.get(target_url)
     time.sleep(2)
 
-    # 딕셔너리({name: value}) 및 리스트([{name:..., value:...}, ...]) 형태 모두 완벽 호환 처리
     if isinstance(cookies, dict):
         for name, value in cookies.items():
             try:
@@ -482,7 +473,6 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
     if any(m in driver.current_url for m in ["accounts.kakao.com", "/auth/login", "tistory.com/login"]):
         raise RuntimeError("티스토리 쿠키 만료. export_cookies.py로 갱신 필요.")
 
-    # 1. 제목 입력
     title_inp = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#post-title-inp")))
     title_inp.clear()
     title_inp.send_keys(strip_non_bmp(title))
@@ -490,7 +480,6 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
 
     safe_html = strip_non_bmp(html_body)
 
-    # 2. [방법 A] 기본모드(TinyMCE) 에디터 인스턴스에 직접 HTML 본문 삽입
     injected = driver.execute_script(
         """
         if (window.tinymce && tinymce.activeEditor) {
@@ -507,7 +496,6 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
     if injected and injected > 0:
         log.info("   📝 TinyMCE 에디터 직접 본문 주입 성공: %d자", injected)
     else:
-        # 3. [방법 B - 폴백] HTML 모드 진입 → CodeMirror 주입 → 기본모드 복귀
         WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-layer-btn-open"))).click()
         time.sleep(0.5)
         WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#editor-mode-html"))).click()
@@ -548,7 +536,6 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
             pass
         time.sleep(1)
 
-    # 4. 태그 입력
     try:
         tag_inp = driver.find_element(By.CSS_SELECTOR, "#tagText")
         for t in tags[:5]:
@@ -558,7 +545,6 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
     except Exception:
         pass
 
-    # 5. 발행 버튼 클릭
     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#publish-layer-btn"))).click()
     time.sleep(1)
     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#open20"))).click()
@@ -669,8 +655,7 @@ def send_telegram_report(results, target_count=18):
                 lines.append(f"      └ <i>사유: {safe_err}</i>")
         lines.append("")
 
-    full_text = "
-".join(lines).strip()
+    full_text = "\n".join(lines).strip()
     chunks = [full_text[i:i + 3800] for i in range(0, len(full_text), 3800)]
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
@@ -721,8 +706,7 @@ def main():
             if cat_key not in POST_CATEGORIES:
                 continue
             cat = POST_CATEGORIES[cat_key]
-            log.info("
-==================================================")
+            log.info("\n==================================================")
             log.info("✍️  [%s] 한/영 듀얼 원고 생성 시작 (1회 호출 절약 모드)", cat["name"])
 
             try:
@@ -750,10 +734,7 @@ def main():
 
             for lang_code, title, md_body, html_body, tags in posts_to_publish:
                 if args.dry_run:
-                    print(f"
-=== [{cat_key} | {lang_code}] {title} ===
-{md_body[:500]}...
-")
+                    print(f"\n=== [{cat_key} | {lang_code}] {title} ===\n{md_body[:500]}...\n")
                     continue
 
                 if "tistory" in targets and driver:
@@ -816,8 +797,7 @@ def main():
             driver.quit()
 
     if not args.dry_run:
-        print("
-===== 최종 멀티 플랫폼 & 한/영 발행 요약 =====")
+        print("\n===== 최종 멀티 플랫폼 & 한/영 발행 요약 =====")
         for k, item in results.items():
             print(f"{'✅' if item['status'] == 'OK' else '❌'} {k:38s} -> {item['info']}")
 
