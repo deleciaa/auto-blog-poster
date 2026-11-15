@@ -135,13 +135,10 @@ def strip_non_bmp(text):
 def md_to_plain(md_text):
     t = re.sub(r"!\[.*?\]\(.*?\)", "", md_text)
     t = re.sub(r"^\*(?:사진|이미지|Image):.*$", "", t, flags=re.M)
-    t = re.sub(r"\[(.*?)\]\(.*?\)", r" ", t)
+    t = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", t)
     t = re.sub(r"^#{1,6}\s*", "", t, flags=re.M)
     t = re.sub(r"(\*\*|__|\*|`)", "", t)
-    t = re.sub(r"
-{3,}", "
-
-", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
 
