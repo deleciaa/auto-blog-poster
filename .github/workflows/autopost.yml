@@ -22,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install google-genai requests markdown google-api-python-client google-auth selenium duckduckgo_search
+          pip install google-genai requests markdown google-api-python-client google-auth selenium duckduckgo_search ddgs
 
       - name: Run Auto Blog Poster (KO + EN across all configured platforms)
         env:
