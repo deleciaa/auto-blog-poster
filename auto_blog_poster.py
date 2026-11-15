@@ -6,7 +6,8 @@
 
 - 단 1회의 Gemini API 호출로 한국어(KO) + 영어(EN) 동시 생성 (일일 쿼터 50% 절약)
 - 429 한도 초과 시 대체 모델 자동 전환
-- 티스토리(TinyMCE 직접 주입 + HTML/WYSIWYG 복귀 2중 안전장치), Blogger, WordPress, Velog 동시 발행
+- 티스토리(쿠키 딕셔너리/리스트 2중 호환 + TinyMCE 직접 주입 + HTML/WYSIWYG 복귀), Blogger, WordPress, Velog 동시 발행
+- DuckDuckGo 기반 실제 나들이 현장 사진 자동 검색 폴백 탑재
 - 발행 완료 후 총 건수, 플랫폼별 제목/링크, 실패 시 상세 사유 텔레그램 자동 보고
 """
 import os
@@ -36,6 +37,8 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoAlertPresentException
+
+from duckduckgo_search import DDGS
 
 # ---------------------------------------------------------
 # 0. 날짜(한국시간 기준) 및 환경 설정
@@ -122,7 +125,9 @@ def call_gemini_smart(contents, use_search=True):
             log.warning("   ⚠️ [Gemini Warning] %s", err_detail)
             errors.append(err_detail)
             time.sleep(3)
-    raise RuntimeError("Gemini 원고 생성 실패:\n" + "\n".join(errors))
+    raise RuntimeError("Gemini 원고 생성 실패:
+" + "
+".join(errors))
 
 
 def strip_non_bmp(text):
@@ -132,15 +137,18 @@ def strip_non_bmp(text):
 def md_to_plain(md_text):
     t = re.sub(r"!\[.*?\]\(.*?\)", "", md_text)
     t = re.sub(r"^\*(?:사진|이미지|Image):.*$", "", t, flags=re.M)
-    t = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", t)
+    t = re.sub(r"\[(.*?)\]\(.*?\)", r" ", t)
     t = re.sub(r"^#{1,6}\s*", "", t, flags=re.M)
     t = re.sub(r"(\*\*|__|\*|`)", "", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"
+{3,}", "
+
+", t)
     return t.strip()
 
 
 # ---------------------------------------------------------
-# 2. 무료 AI 이미지 + 스톡 폴백
+# 2. 무료 AI 이미지 + DuckDuckGo 실제 사진 + 스톡 폴백
 # ---------------------------------------------------------
 _used_images = set()
 
@@ -167,6 +175,21 @@ def get_free_ai_image(en_prompt):
     if _is_image_reachable(url):
         return url, "AI Illustration (Pollinations.ai)"
     raise RuntimeError("Pollinations 응답 지연")
+
+
+def _search_duckduckgo(q):
+    try:
+        log.info("   🔍 DuckDuckGo 실제 사진 검색: '%s'", q)
+        with DDGS() as ddgs:
+            results = list(ddgs.images(q, max_results=8))
+            for r in results:
+                url = r.get("image")
+                if url and url not in _used_images and _is_image_reachable(url):
+                    _used_images.add(url)
+                    return url, f"Real Photo ({q} via DuckDuckGo)"
+    except Exception as e:
+        log.warning("   ⚠️ DuckDuckGo 이미지 검색 실패: %s", e)
+    return None
 
 
 def _search_unsplash(q):
@@ -225,8 +248,10 @@ def get_image(en_keyword):
         try:
             return get_free_ai_image(en_keyword)
         except Exception as e:
-            log.warning("   ⚠️ 무료 AI 이미지 실패 → 스톡 검색 전환: %s", e)
-    for fn in (_search_unsplash, _search_wikimedia):
+            log.warning("   ⚠️ 무료 AI 이미지 실패 → 실제 웹 사진(DuckDuckGo) 검색 전환: %s", e)
+    
+    # AI 이미지 실패 시 DuckDuckGo 실제 사진 검색 먼저 시도, 이후 Unsplash/Wikimedia 폴백
+    for fn in (_search_duckduckgo, _search_unsplash, _search_wikimedia):
         try:
             res = fn(en_keyword)
             if res:
@@ -347,7 +372,8 @@ TITLE: English Title
         if not title:
             title = re.sub(r"^[#*\s]+|[*\s]+$", "", lines[0])
             body_start = 1
-        return title, "\n".join(lines[body_start:]).strip()
+        return title, "
+".join(lines[body_start:]).strip()
 
     title_ko, md_ko_raw = parse_block(ko_part)
     title_en, md_en_raw = parse_block(en_part) if en_part else ("", "")
@@ -358,7 +384,13 @@ TITLE: English Title
         img = get_image(kw.strip())
         if img:
             url, credit = img
-            resolved_imgs.append(f"\n\n![{kw.strip()}]({url})\n\n*Image: {credit}*\n\n")
+            resolved_imgs.append(f"
+
+![{kw.strip()}]({url})
+
+*Image: {credit}*
+
+")
         else:
             resolved_imgs.append("")
 
@@ -390,7 +422,7 @@ def md_to_styled_html(md_text):
 
 
 # ---------------------------------------------------------
-# 4. 티스토리 웹 자동화 (TinyMCE 직접 본문 삽입 + HTML/WYSIWYG 복귀 2중 안전장치)
+# 4. 티스토리 웹 자동화 (쿠키 딕셔너리/리스트 2중 호환 + TinyMCE 직접 본문 삽입)
 # ---------------------------------------------------------
 def init_headless_driver():
     options = webdriver.ChromeOptions()
@@ -407,17 +439,33 @@ def init_headless_driver():
 def inject_cookies_for_domain(driver, target_url):
     if not TISTORY_COOKIES_JSON:
         raise RuntimeError("TISTORY_COOKIES_JSON 시크릿 누락")
-    cookies = json.loads(TISTORY_COOKIES_JSON)
+    
+    try:
+        cookies = json.loads(TISTORY_COOKIES_JSON)
+    except Exception as e:
+        raise RuntimeError(f"TISTORY_COOKIES_JSON JSON 파싱 실패: {e}")
+
     driver.get(target_url)
     time.sleep(2)
-    for c in cookies:
-        cookie_dict = {"name": c["name"], "value": c["value"], "path": c.get("path", "/")}
-        if "domain" in c and "tistory.com" in c["domain"]:
-            cookie_dict["domain"] = c["domain"]
-        try:
-            driver.add_cookie(cookie_dict)
-        except Exception:
-            pass
+
+    # 딕셔너리({name: value}) 및 리스트([{name:..., value:...}, ...]) 형태 모두 완벽 호환 처리
+    if isinstance(cookies, dict):
+        for name, value in cookies.items():
+            try:
+                driver.add_cookie({"name": name, "value": value, "path": "/"})
+            except Exception:
+                pass
+    elif isinstance(cookies, list):
+        for c in cookies:
+            if not isinstance(c, dict):
+                continue
+            cookie_dict = {"name": c.get("name"), "value": c.get("value"), "path": c.get("path", "/")}
+            if "domain" in c and "tistory.com" in c["domain"]:
+                cookie_dict["domain"] = c["domain"]
+            try:
+                driver.add_cookie(cookie_dict)
+            except Exception:
+                pass
 
 
 def post_to_tistory(driver, blog_name, title, html_body, tags):
@@ -626,7 +674,8 @@ def send_telegram_report(results, target_count=18):
                 lines.append(f"      └ <i>사유: {safe_err}</i>")
         lines.append("")
 
-    full_text = "\n".join(lines).strip()
+    full_text = "
+".join(lines).strip()
     chunks = [full_text[i:i + 3800] for i in range(0, len(full_text), 3800)]
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
@@ -677,7 +726,8 @@ def main():
             if cat_key not in POST_CATEGORIES:
                 continue
             cat = POST_CATEGORIES[cat_key]
-            log.info("\n==================================================")
+            log.info("
+==================================================")
             log.info("✍️  [%s] 한/영 듀얼 원고 생성 시작 (1회 호출 절약 모드)", cat["name"])
 
             try:
@@ -705,7 +755,10 @@ def main():
 
             for lang_code, title, md_body, html_body, tags in posts_to_publish:
                 if args.dry_run:
-                    print(f"\n=== [{cat_key} | {lang_code}] {title} ===\n{md_body[:500]}...\n")
+                    print(f"
+=== [{cat_key} | {lang_code}] {title} ===
+{md_body[:500]}...
+")
                     continue
 
                 if "tistory" in targets and driver:
@@ -768,7 +821,8 @@ def main():
             driver.quit()
 
     if not args.dry_run:
-        print("\n===== 최종 멀티 플랫폼 & 한/영 발행 요약 =====")
+        print("
+===== 최종 멀티 플랫폼 & 한/영 발행 요약 =====")
         for k, item in results.items():
             print(f"{'✅' if item['status'] == 'OK' else '❌'} {k:38s} -> {item['info']}")
 
