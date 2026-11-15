@@ -125,9 +125,7 @@ def call_gemini_smart(contents, use_search=True):
             log.warning("   ⚠️ [Gemini Warning] %s", err_detail)
             errors.append(err_detail)
             time.sleep(3)
-    raise RuntimeError("Gemini 원고 생성 실패:
-" + "
-".join(errors))
+    raise RuntimeError("Gemini 원고 생성 실패:\n" + "\n".join(errors))
 
 
 def strip_non_bmp(text):
