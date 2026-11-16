@@ -1,8 +1,8 @@
 """
-멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본 (+ 텔레그램 발행 리포트)
-1. [it_news]     🌐 [오늘의 Tech Top 10] MM월 DD일 전 세계 IT·테크 핵심 뉴스 (+ 전문가 논평)
-2. [it_easy]     🌐 [테크 상식] "한줄 훅!" 최신 테크 키워드 쉽게 풀기
-3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기
+멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본 (+ 동적 시의성 태그 추출 & 텔레그램 발행 리포트)
+1. [it_news]     🌐 [오늘의 Tech Top 10] MM월 DD일 전 세계 IT·테크 핵심 뉴스 (+ 전문가 논평 + 동적 태그)
+2. [it_easy]     🌐 [테크 상식] "한줄 훅!" 최신 테크 키워드 쉽게 풀기 (+ 동적 태그)
+3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기 (+ 동적 태그)
 
 - 단 1회의 Gemini API 호출로 한국어(KO) + 영어(EN) 동시 생성 (일일 쿼터 50% 절약)
 - 429 한도 초과 시 대체 모델 자동 전환
@@ -67,12 +67,6 @@ log = logging.getLogger("autopost")
 
 env = os.environ.get
 GEMINI_API_KEY = env("GEMINI_API_KEY")
-MODEL_CANDIDATES = [
-    env("GEMINI_MODEL", "gemini-3.8-flash"),
-    "gemini-2.5-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-]
 IMAGE_SOURCE = (env("IMAGE_SOURCE", "free_ai") or "free_ai").lower()
 UNSPLASH_ACCESS_KEY = env("UNSPLASH_ACCESS_KEY")
 
@@ -255,14 +249,12 @@ def get_image(en_keyword):
     if IMAGE_SOURCE == "none":
         return None
     
-    # 1순위: 안정적인 무료 AI 이미지 생성 (Rate Limit 완전 회피)
     if IMAGE_SOURCE == "free_ai":
         try:
             return get_free_ai_image(en_keyword)
         except Exception as e:
             log.warning("   ⚠️ 무료 AI 이미지 실패 → 웹 실제 사진(DuckDuckGo) 검색 시도: %s", e)
     
-    # 2순위: DuckDuckGo 실제 정밀 사진 검색
     try:
         res = _search_duckduckgo(en_keyword)
         if res:
@@ -270,7 +262,6 @@ def get_image(en_keyword):
     except Exception:
         pass
 
-    # 3순위: Unsplash / Wikimedia 폴백
     for fn in (_search_unsplash, _search_wikimedia):
         try:
             res = fn(en_keyword)
@@ -283,7 +274,7 @@ def get_image(en_keyword):
 
 
 # ---------------------------------------------------------
-# 3. 3가지 핵심 카테고리 (내용과 완벽히 일치하는 이미지 태그 강제 생성)
+# 3. 3가지 핵심 카테고리 (동적 시의성 태그 추출 프롬프트 탑재)
 # ---------------------------------------------------------
 POST_CATEGORIES = {
     "it_news": {
@@ -291,22 +282,25 @@ POST_CATEGORIES = {
         "tistory_blog": TISTORY_IT_BLOG_NAME,
         "allow_velog": True,
         "use_search": True,
-        "tags_ko": ["오늘의테크뉴스", "IT트렌드", "글로벌IT이슈", "테크논평", "AI뉴스"],
-        "tags_en": ["TechNews", "TechTop10", "ITInsights", "GlobalTech", "EnterpriseIT"],
+        "default_tags_ko": ["오늘의테크뉴스", "IT트렌드", "글로벌IT이슈", "테크논평", "AI뉴스"],
+        "default_tags_en": ["TechNews", "TechTop10", "ITInsights", "GlobalTech", "EnterpriseIT"],
         "prompt": f"""
 당신은 글로벌 IT 인프라·클라우드·네트워크 업계에서 14년 넘게 현장을 뛰어온 IT 전문가입니다.
 Google 검색 도구를 사용하여 오늘({TODAY_KO}, 2026년 기준) 전 세계 및 한국 IT·테크 업계에서 실시간으로 가장 뜨겁게 보도되고 있는 신선하고 다양한 핵심 뉴스 10가지와 전문가 논평을 작성하세요.
 
-[출력 형식 및 이미지 규칙]
+[출력 형식 및 규칙]
 - 본문 중간에 `[IMG: 본문 속 핵심 기술명이나 기업명 및 제품명 (예: NVIDIA AI server rack, Samsung CXL memory)]` 형태의 태그를 정확히 2개 삽입하세요.
-- **절대로 추상적이거나 무관한 단어를 쓰지 말고, 본문에서 방금 다룬 실제 기업이나 기술 영문 명칭을 태그 안에 반드시 포함하세요.**
+- **절대로 추상적이거나 무관한 단어를 쓰지 말고, 본문에서 방금 다룬 실제 기업이나 기술 영문/한글 명칭을 태그 안에 반드시 포함하세요.**
+- 글 하단에 이 글을 대표하는 핵심 검색 태그(오늘의 주요 이슈인 젠슨황, 엔비디아, 특정 기술명 등 포함)를 한국어 5개 내외, 영어 5개 내외 각각 쉼표로 구분하여 `TAGS: ...` 형식으로 작성하세요.
 
 ===KO_START===
 TITLE: 한국어 제목
 (한국어 마크다운 본문 - [IMG: 구체적 기술명/기업명 영문] 태그 2개 포함)
+TAGS: 젠슨황, 엔비디아, 인공지능, 반도체뉴스, IT트렌드
 ===EN_START===
 TITLE: English Title
 (영어 마크다운 본문 - 한국어와 동일한 위치에 동일한 [IMG: 구체적 기술명/기업명 영문] 태그 2개 포함)
+TAGS: JensenHuang, NVIDIA, ArtificialIntelligence, TechNews, ITInsights
 """
     },
     "it_easy": {
@@ -314,22 +308,25 @@ TITLE: English Title
         "tistory_blog": TISTORY_IT_BLOG_NAME,
         "allow_velog": True,
         "use_search": True,
-        "tags_ko": ["테크상식", "쉬운IT", "IT용어정리", "신기술트렌드", "초보자가이드"],
-        "tags_en": ["TechExplained", "TechBasics", "EasyIT", "FutureTech", "TechGlossary"],
+        "default_tags_ko": ["테크상식", "쉬운IT", "IT용어정리", "신기술트렌드", "초보자가이드"],
+        "default_tags_en": ["TechExplained", "TechBasics", "EasyIT", "FutureTech", "TechGlossary"],
         "prompt": f"""
 당신은 복잡한 최신 IT·반도체·AI 기술을 초등학생 아이와 비전공자도 단번에 이해할 수 있도록 재미있게 풀어내는 IT 스토리텔러입니다.
 Google 검색을 활용하여 최근 테크 및 과학계에서 새롭게 주목받고 있는 신기술 또는 트렌드 키워드 1가지를 선정해 소개하세요.
 
-[출력 형식 및 이미지 규칙]
+[출력 형식 및 규칙]
 - 본문 중간에 `[IMG: 해당 기술의 실제 명칭 및 관련 기기/웨이퍼 (예: glass substrate wafer, quantum computer processor)]` 형태의 태그를 정확히 2개 삽입하세요.
 - **선정된 기술의 실제 시각적 대상이 검색되도록 구체적인 영문 키워드를 작성하세요.**
+- 글 하단에 이 글을 대표하는 핵심 검색 태그를 한국어 5개 내외, 영어 5개 내외 각각 쉼표로 구분하여 `TAGS: ...` 형식으로 작성하세요.
 
 ===KO_START===
 TITLE: 한국어 제목
 (한국어 마크다운 본문 - [IMG: 구체적 기술 영문 키워드] 태그 2개 포함)
+TAGS: 테크상식, 쉬운IT, 신기술, 양자컴퓨터, AI기초
 ===EN_START===
 TITLE: English Title
 (영어 마크다운 본문 - 한국어와 동일한 위치에 동일한 [IMG: 구체적 기술 영문 키워드] 태그 2개 포함)
+TAGS: TechExplained, EasyIT, FutureTech, QuantumComputing, TechBasics
 """
     },
     "family_trip": {
@@ -337,24 +334,52 @@ TITLE: English Title
         "tistory_blog": TISTORY_FAMILY_BLOG_NAME,
         "allow_velog": False,  # 주말 나들이 글은 벨로그 미발행
         "use_search": True,
-        "tags_ko": ["주말나들이", "아이와가볼만한곳", "가족여행", "남매육아", "주말코스추천"],
-        "tags_en": ["KoreaFamilyTravel", "KidsActivitiesKorea", "WeekendTripKorea", "FamilyOuting", "TravelWithKids"],
+        "default_tags_ko": ["주말나들이", "아이와가볼만한곳", "가족여행", "남매육아", "주말코스추천"],
+        "default_tags_en": ["KoreaFamilyTravel", "KidsActivitiesKorea", "WeekendTripKorea", "FamilyOuting", "TravelWithKids"],
         "prompt": f"""
 당신은 7살 딸과 5살 아들 아빠입니다. 대한민국에서 7살·5살 남매와 함께 주말에 다녀오기 좋은 실제 나들이 명소 1~2곳을 선정해 실전 정복기를 작성하세요.
 
-[출력 형식 및 이미지 규칙]
+[출력 형식 및 규칙]
 - 본문 중간에 `[IMG: 실제 장소명 영문 + Korea (예: Lotte World Aquarium Seoul, Gwacheon National Science Museum)]` 형태의 태그를 정확히 2개 삽입하세요.
 - **절대로 추상적인 단어(family playing 등)를 쓰지 말고, 본문에서 소개한 실제 나들이 장소의 영문 이름과 'Korea'를 조합하여 태그를 만드세요.**
+- 글 하단에 이 글을 대표하는 핵심 검색 태그(선정된 실제 장소명 포함)를 한국어 5개 내외, 영어 5개 내외 각각 쉼표로 구분하여 `TAGS: ...` 형식으로 작성하세요.
 
 ===KO_START===
 TITLE: 한국어 제목
 (한국어 마크다운 본문 - [IMG: 실제 장소명 영문 + Korea] 태그 2개 포함)
+TAGS: 주말나들이, 아이와가볼만한곳, 과천국립과학관, 가족여행, 남매육아
 ===EN_START===
 TITLE: English Title
 (영어 마크다운 본문 - 한국어와 동일한 위치에 동일한 [IMG: 실제 장소명 영문 + Korea] 태그 2개 포함)
+TAGS: KoreaFamilyTravel, KidsActivitiesKorea, GwacheonScienceMuseum, WeekendTrip, FamilyOuting
 """
     }
 }
+
+
+def parse_block(block_text):
+    lines = block_text.splitlines()
+    title, body_start = None, 0
+    tags = []
+    body_lines = []
+    
+    for line in lines:
+        line_str = line.strip()
+        if not title and re.match(r"^[#*\s]*TITLE\s*[:：]\s*(.+?)[*\s]*$", line_str, re.I):
+            m = re.match(r"^[#*\s]*TITLE\s*[:：]\s*(.+?)[*\s]*$", line_str, re.I)
+            title = m.group(1).strip()
+            continue
+        if re.match(r"^TAGS\s*[:：]\s*(.+?)$", line_str, re.I):
+            m = re.match(r"^TAGS\s*[:：]\s*(.+?)$", line_str, re.I)
+            tags = [t.strip() for t in m.group(1).split(",") if t.strip()]
+            continue
+        body_lines.append(line)
+        
+    if not title and lines:
+        title = re.sub(r"^[#*\s]+|[*\s]+$", "", lines[0])
+        body_lines = lines[1:]
+        
+    return title, "\n".join(body_lines).strip(), tags
 
 
 def generate_bilingual_posts(category_key):
@@ -377,21 +402,13 @@ def generate_bilingual_posts(category_key):
         ko_part = parts[0].replace("===KO_START===", "").strip()
         en_part = parts[1].strip()
 
-    def parse_block(block_text):
-        lines = block_text.splitlines()
-        title, body_start = None, 0
-        for i, line in enumerate(lines[:5]):
-            m = re.match(r"^[#*\s]*TITLE\s*[:：]\s*(.+?)[*\s]*$", line.strip(), re.I)
-            if m:
-                title, body_start = m.group(1).strip(), i + 1
-                break
-        if not title:
-            title = re.sub(r"^[#*\s]+|[*\s]+$", "", lines[0])
-            body_start = 1
-        return title, "\n".join(lines[body_start:]).strip()
+    title_ko, md_ko_raw, tags_ko = parse_block(ko_part)
+    title_en, md_en_raw, tags_en = parse_block(en_part) if en_part else ("", "", [])
 
-    title_ko, md_ko_raw = parse_block(ko_part)
-    title_en, md_en_raw = parse_block(en_part) if en_part else ("", "")
+    if not tags_ko:
+        tags_ko = cat.get("default_tags_ko", ["IT트렌드", "테크뉴스"])
+    if not tags_en:
+        tags_en = cat.get("default_tags_en", ["TechNews", "ITInsights"])
 
     img_tags = re.findall(r"\[IMG:\s*(.+?)\]", md_ko_raw)
     resolved_imgs = []
@@ -414,7 +431,7 @@ def generate_bilingual_posts(category_key):
 
     md_ko = apply_images(md_ko_raw)
     md_en = apply_images(md_en_raw) if md_en_raw else ""
-    return title_ko, md_ko, title_en, md_en
+    return title_ko, md_ko, tags_ko, title_en, md_en, tags_en
 
 
 def md_to_styled_html(md_text):
@@ -674,7 +691,7 @@ def send_telegram_report(results, target_count=18):
             else:
                 safe_err = html.escape(str(it["info"])[:150])
                 lines.append(f"  ❌ [{it['lang']}] {safe_title}")
-                lines.append(f"      └ <i>사유: {safe_err}</i>")
+                lines.append(f"     └ <i>사유: {safe_err}</i>")
         lines.append("")
 
     full_text = "\n".join(lines).strip()
@@ -732,7 +749,7 @@ def main():
             log.info("✍️  [%s] 한/영 듀얼 원고 생성 시작 (1회 호출 절약 모드)", cat["name"])
 
             try:
-                title_ko, md_ko, title_en, md_en = generate_bilingual_posts(cat_key)
+                title_ko, md_ko, tags_ko, title_en, md_en, tags_en = generate_bilingual_posts(cat_key)
             except Exception as e:
                 log.error("🚨 [%s] 원고 생성(Gemini API) 실패: %s", cat["name"], e)
                 results[f"{cat_key}:gemini"] = {
@@ -744,19 +761,19 @@ def main():
                 }
                 continue
 
-            log.info("📌 [KO] 제목: %s (%d자)", title_ko, len(md_to_plain(md_ko)))
+            log.info("📌 [KO] 제목: %s | 태그: %s", title_ko, ", ".join(tags_ko))
             if title_en:
-                log.info("📌 [EN] Title: %s (%d chars)", title_en, len(md_to_plain(md_en)))
+                log.info("📌 [EN] Title: %s | Tags: %s", title_en, ", ".join(tags_en))
 
             posts_to_publish = []
             if "ko" in langs and title_ko:
-                posts_to_publish.append(("KO", title_ko, md_ko, md_to_styled_html(md_ko), cat["tags_ko"]))
+                posts_to_publish.append(("KO", title_ko, md_ko, md_to_styled_html(md_ko), tags_ko))
             if "en" in langs and title_en:
-                posts_to_publish.append(("EN", title_en, md_en, md_to_styled_html(md_en), cat["tags_en"]))
+                posts_to_publish.append(("EN", title_en, md_en, md_to_styled_html(md_en), tags_en))
 
             for lang_code, title, md_body, html_body, tags in posts_to_publish:
                 if args.dry_run:
-                    print(f"\n=== [{cat_key} | {lang_code}] {title} ===\n{md_body[:500]}...\n")
+                    print(f"\n=== [{cat_key} | {lang_code}] {title} ===\nTags: {tags}\n{md_body[:500]}...\n")
                     continue
 
                 if "tistory" in targets and driver:
