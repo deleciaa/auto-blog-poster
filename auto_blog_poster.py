@@ -1,10 +1,11 @@
 """
-멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본 (+ 동적 시의성 태그 추출 & 텔레그램 발행 리포트)
+멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본 (+ 동적 시의성 태그 추출 & 텔레그램 발행 리포트 & 한/영 분리 방어)
 1. [it_news]     🌐 [오늘의 Tech Top 10] MM월 DD일 전 세계 IT·테크 핵심 뉴스 (+ 전문가 논평 + 동적 태그)
 2. [it_easy]     🌐 [테크 상식] "한줄 훅!" 최신 테크 키워드 쉽게 풀기 (+ 동적 태그)
 3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기 (+ 동적 태그)
 
 - 단 1회의 Gemini API 호출로 한국어(KO) + 영어(EN) 동시 생성 (일일 쿼터 50% 절약)
+- 정규표현식 기반 다중 구분자 파싱으로 한/영 합본 현상 원천 차단
 - 429 한도 초과 시 대체 모델 자동 전환
 - 티스토리(쿠키 딕셔너리/리스트 2중 호환 + TinyMCE 직접 주입 + HTML/WYSIWYG 복귀), Blogger, WordPress, Velog 동시 발행
 - DuckDuckGo(ddgs) 및 무료 AI 이미지 기반 실제 현장/장소/기술 사진 정밀 검색 폴백 탑재
@@ -359,7 +360,7 @@ TAGS: KoreaFamilyTravel, KidsActivitiesKorea, GwacheonScienceMuseum, WeekendTrip
 
 def parse_block(block_text):
     lines = block_text.splitlines()
-    title, body_start = None, 0
+    title = None
     tags = []
     body_lines = []
     
@@ -369,8 +370,8 @@ def parse_block(block_text):
             m = re.match(r"^[#*\s]*TITLE\s*[:：]\s*(.+?)[*\s]*$", line_str, re.I)
             title = m.group(1).strip()
             continue
-        if re.match(r"^TAGS\s*[:：]\s*(.+?)$", line_str, re.I):
-            m = re.match(r"^TAGS\s*[:：]\s*(.+?)$", line_str, re.I)
+        if re.match(r"^[#*\s]*TAGS\s*[:：]\s*(.+?)[*\s]*$", line_str, re.I):
+            m = re.match(r"^[#*\s]*TAGS\s*[:：]\s*(.+?)[*\s]*$", line_str, re.I)
             tags = [t.strip() for t in m.group(1).split(",") if t.strip()]
             continue
         body_lines.append(line)
@@ -382,12 +383,34 @@ def parse_block(block_text):
     return title, "\n".join(body_lines).strip(), tags
 
 
+def split_bilingual_raw(raw_text):
+    """Gemini 응답에서 한국어(KO)와 영어(EN) 블록을 다중 방어 로직으로 안전하게 분리"""
+    cleaned = re.sub(r"^[#*\s]*===\s*KO_START\s*===[*\s]*", "", raw_text, flags=re.M | re.I).strip()
+
+    # 1차: ===EN_START=== 구분자 분리 (앞뒤 공백, 대소문자, 마크다운 기호 #, * 허용)
+    en_split = re.split(r"\n[#*\s]*===\s*EN_START\s*===[*\s]*\n?", cleaned, maxsplit=1, flags=re.I)
+    if len(en_split) == 2:
+        return en_split[0].strip(), en_split[1].strip()
+
+    # 2차: 구분자 누락 시 두 번째 TITLE: 라인을 기준으로 분리
+    title_matches = list(re.finditer(r"^[#*\s]*TITLE\s*[:：]", cleaned, flags=re.M | re.I))
+    if len(title_matches) >= 2:
+        split_idx = title_matches[1].start()
+        log.warning("   ⚠️ ===EN_START=== 구분자 누락 감지 → 두 번째 TITLE 위치에서 자동 분리 수행")
+        return cleaned[:split_idx].strip(), cleaned[split_idx:].strip()
+
+    log.warning("   ⚠️ 영문 블록 분리 실패: 단일 블록으로 처리됩니다.")
+    return cleaned, ""
+
+
 def generate_bilingual_posts(category_key):
     cat = POST_CATEGORIES[category_key]
     prompt = f"""
 {cat['prompt']}
 
-[절대 금지 사항]
+[절대 금지 사항 및 출력 규칙]
+- 반드시 `===KO_START===` 와 `===EN_START===` 구분자를 마크다운 기호(`**`, `###` 등)나 공백 없이 단독 줄에 정확히 출력하세요.
+- 한국어 글과 영어 글은 각각 독립된 완전한 게시글 형태로 작성하세요.
 - 괄호형 메모 `(확인 필요)` 등 절대 출력 금지.
 - AI 번역투("새로운 지평", "결론적으로", "In conclusion", "delve into") 금지.
 - 가상의 화자 이름(김대현 등) 금지.
@@ -396,11 +419,7 @@ def generate_bilingual_posts(category_key):
     raw = (resp.text or "").strip()
     raw = re.sub(r"\([^)]*확인\s*필요[^)]*\)", "", raw)
 
-    ko_part, en_part = raw, ""
-    if "===EN_START===" in raw:
-        parts = raw.split("===EN_START===", 1)
-        ko_part = parts[0].replace("===KO_START===", "").strip()
-        en_part = parts[1].strip()
+    ko_part, en_part = split_bilingual_raw(raw)
 
     title_ko, md_ko_raw, tags_ko = parse_block(ko_part)
     title_en, md_en_raw, tags_en = parse_block(en_part) if en_part else ("", "", [])
