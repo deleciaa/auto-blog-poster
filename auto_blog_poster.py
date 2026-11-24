@@ -1,8 +1,8 @@
 """
-멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본 (+ 동적 시의성 태그 추출 & 텔레그램 발행 리포트 & 한/영 분리 방어)
+멀티 플랫폼 & 한/영 듀얼 자동 포스팅 최종 통합본 (+ 동적 시의성 태그 추출 & 텔레그램 발행 리포트 & 한/영 분리 방어 & 나들이 장소 중복 방지)
 1. [it_news]     🌐 [오늘의 Tech Top 10] MM월 DD일 전 세계 IT·테크 핵심 뉴스 (+ 전문가 논평 + 동적 태그)
 2. [it_easy]     🌐 [테크 상식] "한줄 훅!" 최신 테크 키워드 쉽게 풀기 (+ 동적 태그)
-3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기 (+ 동적 태그)
+3. [family_trip] [주말 나들이] "한줄 훅!" + 7살 딸, 5살 아들과 함께한 [장소명] 정복기 (+ 동적 태그 + 권역 로테이션 + 중복 방지)
 
 - 단 1회의 Gemini API 호출로 한국어(KO) + 영어(EN) 동시 생성 (일일 쿼터 50% 절약)
 - 정규표현식 기반 다중 구분자 파싱으로 한/영 합본 현상 원천 차단
@@ -94,6 +94,9 @@ VELOG_REFRESH_TOKEN = env("VELOG_REFRESH_TOKEN")
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
 
+# 기발행 이력 관리 파일
+HISTORY_PATH = "posted_history.json"
+
 client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(api_version="v1beta")
@@ -101,13 +104,13 @@ client = genai.Client(
 
 
 # ---------------------------------------------------------
-# 1. 스마트 모델 폴백 호출기 (429 / 503 자동 방어)
+# 1. 스마트 모델 폴백 호출기 (429 / 503 자동 방어 + Temperature 제어)
 # ---------------------------------------------------------
-def call_gemini_smart(contents, use_search=True):
-    cfg = (
-        types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
-        if use_search
-        else None
+def call_gemini_smart(contents, use_search=True, temperature=0.7):
+    tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else None
+    cfg = types.GenerateContentConfig(
+        tools=tools,
+        temperature=temperature,
     )
     errors = []
     for model_name in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
@@ -119,7 +122,7 @@ def call_gemini_smart(contents, use_search=True):
             )
             if not getattr(resp, "text", None):
                 raise ValueError("빈 응답 반환")
-            log.info("   🤖 Gemini 응답 성공 (모델: %s)", model_name)
+            log.info("   🤖 Gemini 응답 성공 (모델: %s, temp: %.2f)", model_name, temperature)
             return resp
         except Exception as e:
             err_detail = f"{model_name} -> {e}"
@@ -275,7 +278,44 @@ def get_image(en_keyword):
 
 
 # ---------------------------------------------------------
-# 3. 3가지 핵심 카테고리 (동적 시의성 태그 추출 프롬프트 탑재)
+# 3. 기발행 이력 관리 & 나들이 권역/테마 자동 로테이션
+# ---------------------------------------------------------
+def load_posted_history():
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("family_trip", [])
+                    data.setdefault("it_easy", [])
+                    return data
+        except Exception as e:
+            log.warning("   ⚠️ 기발행 이력 로드 실패 (초기화): %s", e)
+    return {"family_trip": [], "it_easy": []}
+
+
+def save_posted_history(history):
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("   ⚠️ 기발행 이력 저장 실패: %s", e)
+
+
+TRIP_THEMES = [
+    "서울 도심 속 숨은 박물관, 미술관 또는 역사 유적지 체험",
+    "경기도 남부(용인, 수원, 화성, 이천, 안성 등) 체험농장, 수목원 또는 테마파크",
+    "경기도 북부(파주, 포천, 양주, 가평, 남양주 등) 자연 생태공원, 숲체험 또는 이색 전시관",
+    "인천(송도, 영종도, 강화도 등) 바다·갯벌 체험, 해양박물관 또는 공원 나들이",
+    "강원도/충청권(춘천, 원주, 천안, 아산, 태안 등) 당일치기 또는 1박 2일 가족 여행지",
+    "아이들이 직접 몸으로 뛰고 직업·과학·안전 체험을 할 수 있는 실내 키즈 체험관",
+    "계절에 맞는 전통문화 마을, 식물원, 동물 교감 체험장 또는 공방 원데이클래스",
+]
+TODAY_TRIP_THEME = TRIP_THEMES[NOW_KST.toordinal() % len(TRIP_THEMES)]
+
+
+# ---------------------------------------------------------
+# 4. 3가지 핵심 카테고리 (동적 시의성 태그 추출 프롬프트 탑재)
 # ---------------------------------------------------------
 POST_CATEGORIES = {
     "it_news": {
@@ -340,19 +380,23 @@ TAGS: TechExplained, EasyIT, FutureTech, QuantumComputing, TechBasics
         "prompt": f"""
 당신은 7살 딸과 5살 아들 아빠입니다. 대한민국에서 7살·5살 남매와 함께 주말에 다녀오기 좋은 실제 나들이 명소 1~2곳을 선정해 실전 정복기를 작성하세요.
 
+[오늘의 필수 선정 테마]
+- 반드시 **'{TODAY_TRIP_THEME}'** 테마에 해당하는 실제 장소를 새롭게 발굴하여 선정하세요.
+- 뻔한 대형 프랜차이즈 아쿠아리움이나 과천국립과학관 대신, 7살·5살 남매가 실제로 좋아할 만한 구체적이고 특색 있는 코스를 추천하세요.
+
 [출력 형식 및 규칙]
-- 본문 중간에 `[IMG: 실제 장소명 영문 + Korea (예: Lotte World Aquarium Seoul, Gwacheon National Science Museum)]` 형태의 태그를 정확히 2개 삽입하세요.
+- 본문 중간에 `[IMG: 실제 장소명 영문 + Korea (예: Seoul Children's Grand Park Korea, Paju Heyri Art Valley Korea)]` 형태의 태그를 정확히 2개 삽입하세요.
 - **절대로 추상적인 단어(family playing 등)를 쓰지 말고, 본문에서 소개한 실제 나들이 장소의 영문 이름과 'Korea'를 조합하여 태그를 만드세요.**
 - 글 하단에 이 글을 대표하는 핵심 검색 태그(선정된 실제 장소명 포함)를 한국어 5개 내외, 영어 5개 내외 각각 쉼표로 구분하여 `TAGS: ...` 형식으로 작성하세요.
 
 ===KO_START===
 TITLE: 한국어 제목
 (한국어 마크다운 본문 - [IMG: 실제 장소명 영문 + Korea] 태그 2개 포함)
-TAGS: 주말나들이, 아이와가볼만한곳, 과천국립과학관, 가족여행, 남매육아
+TAGS: 주말나들이, 아이와가볼만한곳, 선정장소명, 가족여행, 남매육아
 ===EN_START===
 TITLE: English Title
 (영어 마크다운 본문 - 한국어와 동일한 위치에 동일한 [IMG: 실제 장소명 영문 + Korea] 태그 2개 포함)
-TAGS: KoreaFamilyTravel, KidsActivitiesKorea, GwacheonScienceMuseum, WeekendTrip, FamilyOuting
+TAGS: KoreaFamilyTravel, KidsActivitiesKorea, SelectedPlaceName, WeekendTrip, FamilyOuting
 """
     }
 }
@@ -405,9 +449,21 @@ def split_bilingual_raw(raw_text):
 
 def generate_bilingual_posts(category_key):
     cat = POST_CATEGORIES[category_key]
+    history = load_posted_history()
+    past_items = history.get(category_key, [])
+
+    exclude_instruction = ""
+    if past_items:
+        recent_list = " / ".join(past_items[-30:])
+        exclude_instruction = f"""
+[중복 금지 - 절대 제외 목록]
+아래 제목/장소/주제는 이미 블로그에 발행했으므로 **절대 다시 선정하지 말고** 완전히 새로운 대상을 고르세요:
+- 기발행 목록: {recent_list}
+"""
+
     prompt = f"""
 {cat['prompt']}
-
+{exclude_instruction}
 [절대 금지 사항 및 출력 규칙]
 - 반드시 `===KO_START===` 와 `===EN_START===` 구분자를 마크다운 기호(`**`, `###` 등)나 공백 없이 단독 줄에 정확히 출력하세요.
 - 한국어 글과 영어 글은 각각 독립된 완전한 게시글 형태로 작성하세요.
@@ -415,7 +471,8 @@ def generate_bilingual_posts(category_key):
 - AI 번역투("새로운 지평", "결론적으로", "In conclusion", "delve into") 금지.
 - 가상의 화자 이름(김대현 등) 금지.
 """
-    resp = call_gemini_smart(prompt, use_search=cat.get("use_search", True))
+    temp = 1.05 if category_key == "family_trip" else 0.7
+    resp = call_gemini_smart(prompt, use_search=cat.get("use_search", True), temperature=temp)
     raw = (resp.text or "").strip()
     raw = re.sub(r"\([^)]*확인\s*필요[^)]*\)", "", raw)
 
@@ -428,6 +485,11 @@ def generate_bilingual_posts(category_key):
         tags_ko = cat.get("default_tags_ko", ["IT트렌드", "테크뉴스"])
     if not tags_en:
         tags_en = cat.get("default_tags_en", ["TechNews", "ITInsights"])
+
+    if category_key in history and title_ko:
+        history[category_key].append(title_ko)
+        history[category_key] = history[category_key][-50:]
+        save_posted_history(history)
 
     img_tags = re.findall(r"\[IMG:\s*(.+?)\]", md_ko_raw)
     resolved_imgs = []
@@ -467,7 +529,7 @@ def md_to_styled_html(md_text):
 
 
 # ---------------------------------------------------------
-# 4. 티스토리 웹 자동화 (쿠키 딕셔너리/리스트 2중 호환 + TinyMCE 직접 본문 삽입)
+# 5. 티스토리 웹 자동화 (쿠키 딕셔너리/리스트 2중 호환 + TinyMCE 직접 본문 삽입)
 # ---------------------------------------------------------
 def init_headless_driver():
     options = webdriver.ChromeOptions()
@@ -614,7 +676,7 @@ def post_to_tistory(driver, blog_name, title, html_body, tags):
 
 
 # ---------------------------------------------------------
-# 5. 멀티 API 플랫폼 (Blogger / WordPress / Velog)
+# 6. 멀티 API 플랫폼 (Blogger / WordPress / Velog)
 # ---------------------------------------------------------
 def post_to_blogger(title, html_body, tags):
     if BLOGGER_TOKEN_JSON and not os.path.exists(BLOGGER_TOKEN_PATH):
@@ -680,7 +742,7 @@ def post_to_velog(title, md_body, tags):
 
 
 # ---------------------------------------------------------
-# 6. 텔레그램 발행 리포트 발송기
+# 7. 텔레그램 발행 리포트 발송기
 # ---------------------------------------------------------
 def send_telegram_report(results, target_count=18):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -736,7 +798,7 @@ def send_telegram_report(results, target_count=18):
 
 
 # ---------------------------------------------------------
-# 7. 메인 컨트롤러
+# 8. 메인 컨트롤러
 # ---------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -766,6 +828,8 @@ def main():
             cat = POST_CATEGORIES[cat_key]
             log.info("\n==================================================")
             log.info("✍️  [%s] 한/영 듀얼 원고 생성 시작 (1회 호출 절약 모드)", cat["name"])
+            if cat_key == "family_trip":
+                log.info("🧭 오늘의 나들이 선정 테마: %s", TODAY_TRIP_THEME)
 
             try:
                 title_ko, md_ko, tags_ko, title_en, md_en, tags_en = generate_bilingual_posts(cat_key)
