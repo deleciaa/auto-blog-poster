@@ -5,6 +5,9 @@ on:
     types: [auto-blog-poster]  # cron-job.org에서 호출할 이벤트 이름
   workflow_dispatch:           # GitHub 웹화면 수동 실행 버튼 유지
 
+permissions:
+  contents: write              # posted_history.json 자동 커밋·푸시 필수 권한
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -47,3 +50,12 @@ jobs:
         with:
           name: error-logs
           path: logs/
+
+      - name: Save posted history
+        if: always()
+        run: |
+          git config user.name "Aaron Eom"
+          git config user.email "eom.aaron@gmail.com"
+          git add posted_history.json
+          git diff --staged --quiet || git commit -m "chore: update posted history [skip ci]"
+          git push
